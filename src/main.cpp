@@ -1142,8 +1142,13 @@ static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClas
 template <typename Gfx>
 static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
     if (isRotorcraft(item)) {
-        g.drawWideLine(cx - 6, cy - 6, cx + 6, cy + 6, 2.0f, colorPlane);
-        g.drawWideLine(cx - 6, cy + 6, cx + 6, cy - 6, 2.0f, colorPlane);
+        g.drawWideLine(cx - 3, cy - 3, cx + 3, cy + 3, 2.0f, colorPlane);
+        g.drawWideLine(cx - 3, cy + 3, cx + 3, cy - 3, 2.0f, colorPlane);
+
+        float rad = item.noseDeg * DEG_TO_RAD;
+        int tailX = cx - lroundf(sinf(rad) * 7);
+        int tailY = cy + lroundf(cosf(rad) * 7);
+        g.drawWideLine(cx, cy, tailX, tailY, 2.0f, colorPlane);
         return;
     }
     drawPlane(g, cx, cy, item.noseDeg, planeSizeClass(item));
