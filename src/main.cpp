@@ -80,6 +80,7 @@ struct Aircraft {
     float verticalRateFpm = 0;
     char callsign[10] = {};
     char type[8] = {};
+    char category[4] = {};
     char alt[14] = {};
     char vsi[12] = {};
     float distanceKm = 0;
@@ -1011,6 +1012,7 @@ static bool fetchAdsb() {
                 copyJsonStringTrimmed(plane, "hex", dst.callsign, sizeof(dst.callsign));
             }
             copyJsonStringTrimmed(plane, "t", dst.type, sizeof(dst.type));
+            copyJsonStringTrimmed(plane, "category", dst.category, sizeof(dst.category));
             formatAltitude(plane, dst.alt, sizeof(dst.alt));
             formatVerticalRate(dst.verticalRateFpm, dst.vsi, sizeof(dst.vsi));
             fetchedCount++;
@@ -1091,18 +1093,59 @@ static void prepareAircraftGeometry() {
     });
 }
 
+static bool isRotorcraft(const Aircraft &item) {
+    return strcmp(item.category, "A7") == 0;
+}
+
+static uint8_t planeSizeClass(const Aircraft &item) {
+    if (item.category[0] == 'A') {
+        if (item.category[1] == '1' || item.category[1] == '2') {
+            return 0;
+        }
+        if (item.category[1] == '4' || item.category[1] == '5') {
+            return 2;
+        }
+    }
+    if (item.category[0] == 'B') {
+        return 0;
+    }
+    return 1;
+}
+
 template <typename Gfx>
-static void drawPlane(Gfx &g, int cx, int cy, float headingDeg) {
+static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClass) {
+    int tipLen = 12;
+    int tailLen = 8;
+    int wingLen = 6;
+    if (sizeClass == 0) {
+        tipLen = 9;
+        tailLen = 6;
+        wingLen = 5;
+    } else if (sizeClass >= 2) {
+        tipLen = 15;
+        tailLen = 10;
+        wingLen = 8;
+    }
+
     float rad = headingDeg * DEG_TO_RAD;
     float s = sinf(rad);
     float c = cosf(rad);
-    int tipX = cx + lroundf(s * 12);
-    int tipY = cy - lroundf(c * 12);
-    int tailX = cx - lroundf(s * 8);
-    int tailY = cy + lroundf(c * 8);
-    int wingX = lroundf(c * 6);
-    int wingY = lroundf(s * 6);
+    int tipX = cx + lroundf(s * tipLen);
+    int tipY = cy - lroundf(c * tipLen);
+    int tailX = cx - lroundf(s * tailLen);
+    int tailY = cy + lroundf(c * tailLen);
+    int wingX = lroundf(c * wingLen);
+    int wingY = lroundf(s * wingLen);
     g.fillTriangle(tipX, tipY, tailX + wingX, tailY + wingY, tailX - wingX, tailY - wingY, colorPlane);
+}
+
+template <typename Gfx>
+static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
+    if (isRotorcraft(item)) {
+        g.fillSmoothCircle(cx, cy, 5, colorPlane);
+        return;
+    }
+    drawPlane(g, cx, cy, item.noseDeg, planeSizeClass(item));
 }
 
 template <typename Gfx>
@@ -1158,7 +1201,7 @@ static void drawAircraftList(Gfx &g) {
         int iconX = PANEL_X + 20;
         int iconY = rowY + 23;
 
-        drawPlane(g, iconX, iconY, item.noseDeg);
+        drawAircraftSymbol(g, item, iconX, iconY);
 
         g.setTextDatum(textdatum_t::top_left);
         g.setTextSize(2);
@@ -1256,7 +1299,7 @@ static void drawRadar() {
             continue;
         }
         if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) continue;
-        drawPlane(g, x, y, aircraft[i].noseDeg);
+        drawAircraftSymbol(g, aircraft[i], x, y);
     }
 
     g.setTextSize(1);
