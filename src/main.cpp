@@ -115,10 +115,25 @@ static uint32_t lastReconnectMs = 0;
 static uint32_t lastFetchMs = 0;
 static uint32_t lastDrawMs = 0;
 static uint32_t lastRouteLookupMs = 0;
+static SemaphoreHandle_t stateMutex = nullptr;
+static TaskHandle_t networkTaskHandle = nullptr;
+static volatile bool networkDataDirty = false;
 static bool touchWasDown = false;
 static uint32_t touchDownMs = 0;
 static bool longPressHandled = false;
 static bool configNoticeShown = false;
+
+static void lockState() {
+    if (stateMutex != nullptr) {
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+    }
+}
+
+static void unlockState() {
+    if (stateMutex != nullptr) {
+        xSemaphoreGive(stateMutex);
+    }
+}
 
 struct RangePreset {
     float outerKm;
@@ -811,12 +826,20 @@ static bool lookupRouteForCallsign(RouteCacheEntry &entry) {
 }
 
 static bool serviceRouteLookup() {
-    if (WiFi.status() != WL_CONNECTED || aircraftCount == 0) {
+    if (WiFi.status() != WL_CONNECTED) {
         return false;
     }
 
     uint32_t now = millis();
     if (now - lastRouteLookupMs < ROUTE_LOOKUP_INTERVAL_MS) {
+        return false;
+    }
+
+    RouteCacheEntry lookupEntry;
+    bool hasCandidate = false;
+    lockState();
+    if (aircraftCount == 0) {
+        unlockState();
         return false;
     }
 
@@ -829,17 +852,36 @@ static bool serviceRouteLookup() {
         lastRouteLookupMs = now;
         entry.lastLookupMs = now;
         entry.lookupDone = true;
-        bool ok = lookupRouteForCallsign(entry);
-        Serial.printf("[route] callsign=%s ok=%d origin=%s destination=%s\n",
-                      entry.callsign,
-                      ok ? 1 : 0,
-                      entry.originIata,
-                      entry.destinationIata);
-        Serial.flush();
-        return ok;
+        lookupEntry = entry;
+        hasCandidate = true;
+        break;
+    }
+    unlockState();
+
+    if (!hasCandidate) {
+        return false;
     }
 
-    return false;
+    bool ok = lookupRouteForCallsign(lookupEntry);
+
+    lockState();
+    RouteCacheEntry *entry = findRouteCacheEntry(lookupEntry.callsign);
+    if (entry != nullptr) {
+        if (ok) {
+            strlcpy(entry->originIata, lookupEntry.originIata, sizeof(entry->originIata));
+            strlcpy(entry->destinationIata, lookupEntry.destinationIata, sizeof(entry->destinationIata));
+            entry->hasRoute = true;
+            networkDataDirty = true;
+        }
+        Serial.printf("[route] callsign=%s ok=%d origin=%s destination=%s\n",
+                      entry->callsign,
+                      ok ? 1 : 0,
+                      entry->originIata,
+                      entry->destinationIata);
+    }
+    unlockState();
+    Serial.flush();
+    return ok;
 }
 
 template <typename Gfx>
@@ -896,6 +938,13 @@ static bool isGroundAircraft(const JsonObject &plane) {
     return plane["alt_baro"].is<const char *>() && strcmp(plane["alt_baro"].as<const char *>(), "ground") == 0;
 }
 
+static void setLastFetchText(const String &text) {
+    lockState();
+    lastFetchText = text;
+    networkDataDirty = true;
+    unlockState();
+}
+
 static bool fetchAdsb() {
     if (WiFi.status() != WL_CONNECTED) {
         return false;
@@ -913,13 +962,13 @@ static bool fetchAdsb() {
     client.setInsecure();
     HTTPClient http;
     if (!http.begin(client, url)) {
-        lastFetchText = "HTTP BEGIN FAIL";
+        setLastFetchText("HTTP BEGIN FAIL");
         return false;
     }
     http.setTimeout(10000);
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
-        lastFetchText = "HTTP " + String(code);
+        setLastFetchText("HTTP " + String(code));
         http.end();
         return false;
     }
@@ -930,48 +979,54 @@ static bool fetchAdsb() {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err) {
-        lastFetchText = "JSON ERROR";
+        setLastFetchText("JSON ERROR");
         return false;
     }
 
+    static Aircraft fetchedAircraft[MAX_AIRCRAFT];
+    size_t fetchedCount = 0;
     JsonArray ac = doc["ac"].as<JsonArray>();
-    aircraftCount = 0;
     uint32_t fetchNow = millis();
-    if (ac.isNull()) {
-        syncRouteCacheFromAircraft(fetchNow);
-        lastFetchText = "0 AIRCRAFT";
-        return true;
-    }
 
-    for (JsonObject plane : ac) {
-        if (aircraftCount >= MAX_AIRCRAFT) break;
-        if (!plane["lat"].is<float>() || !plane["lon"].is<float>()) continue;
-        if (isGroundAircraft(plane)) continue;
+    if (!ac.isNull()) {
+        for (JsonObject plane : ac) {
+            if (fetchedCount >= MAX_AIRCRAFT) break;
+            if (!plane["lat"].is<float>() || !plane["lon"].is<float>()) continue;
+            if (isGroundAircraft(plane)) continue;
 
-        Aircraft &dst = aircraft[aircraftCount];
-        dst = Aircraft();
-        dst.lat = plane["lat"].as<float>();
-        dst.lon = plane["lon"].as<float>();
-        dst.renderLat = dst.lat;
-        dst.renderLon = dst.lon;
-        dst.positionMs = fetchNow;
-        dst.noseDeg = pickHeading(plane, false);
-        dst.trackDeg = pickHeading(plane, true);
-        dst.gsKnots = pickSpeed(plane);
-        dst.verticalRateFpm = pickVerticalRate(plane);
-        copyJsonStringTrimmed(plane, "flight", dst.callsign, sizeof(dst.callsign));
-        dst.hasFlight = dst.callsign[0] != '\0';
-        if (!dst.hasFlight) {
-            copyJsonStringTrimmed(plane, "hex", dst.callsign, sizeof(dst.callsign));
+            Aircraft &dst = fetchedAircraft[fetchedCount];
+            dst = Aircraft();
+            dst.lat = plane["lat"].as<float>();
+            dst.lon = plane["lon"].as<float>();
+            dst.renderLat = dst.lat;
+            dst.renderLon = dst.lon;
+            dst.positionMs = fetchNow;
+            dst.noseDeg = pickHeading(plane, false);
+            dst.trackDeg = pickHeading(plane, true);
+            dst.gsKnots = pickSpeed(plane);
+            dst.verticalRateFpm = pickVerticalRate(plane);
+            copyJsonStringTrimmed(plane, "flight", dst.callsign, sizeof(dst.callsign));
+            dst.hasFlight = dst.callsign[0] != '\0';
+            if (!dst.hasFlight) {
+                copyJsonStringTrimmed(plane, "hex", dst.callsign, sizeof(dst.callsign));
+            }
+            copyJsonStringTrimmed(plane, "t", dst.type, sizeof(dst.type));
+            formatAltitude(plane, dst.alt, sizeof(dst.alt));
+            formatVerticalRate(dst.verticalRateFpm, dst.vsi, sizeof(dst.vsi));
+            fetchedCount++;
         }
-        copyJsonStringTrimmed(plane, "t", dst.type, sizeof(dst.type));
-        formatAltitude(plane, dst.alt, sizeof(dst.alt));
-        formatVerticalRate(dst.verticalRateFpm, dst.vsi, sizeof(dst.vsi));
-        aircraftCount++;
     }
 
+    lockState();
+    if (fetchedCount > 0) {
+        memcpy(aircraft, fetchedAircraft, fetchedCount * sizeof(Aircraft));
+    }
+    aircraftCount = fetchedCount;
     syncRouteCacheFromAircraft(fetchNow);
     lastFetchText = String(aircraftCount) + " AIRCRAFT";
+    networkDataDirty = true;
+    unlockState();
+
     Serial.println("[adsb] " + lastFetchText);
     return true;
 }
@@ -1141,6 +1196,7 @@ static void drawAircraftList(Gfx &g) {
 static void drawRadar() {
     static uint32_t drawCounter = 0;
     drawCounter++;
+    lockState();
     bool logDraw = drawCounter <= 3 || drawCounter % 120 == 0;
     if (logDraw) {
         Serial.printf("[draw] #%lu begin aircraft=%u wifi=%d w=%d h=%d free_heap=%u free_psram=%u\n",
@@ -1237,6 +1293,7 @@ static void drawRadar() {
                       static_cast<unsigned long>(lastDrawMs));
         Serial.flush();
     }
+    unlockState();
 }
 
 static void handleTouch() {
@@ -1272,6 +1329,64 @@ static void handleTouch() {
     touchWasDown = down;
 }
 
+static bool shouldDrawRadarFrame(uint32_t now) {
+    lockState();
+    bool dirty = networkDataDirty;
+    if (dirty) {
+        networkDataDirty = false;
+    }
+    bool hasAircraft = aircraftCount > 0;
+    uint32_t previousDrawMs = lastDrawMs;
+    unlockState();
+
+    return dirty || (hasAircraft && now - previousDrawMs >= RADAR_DRAW_INTERVAL_MS);
+}
+
+static void networkTaskMain(void *) {
+    Serial.printf("[task] network start core=%d\n", xPortGetCoreID());
+    Serial.flush();
+
+    while (true) {
+        uint32_t now = millis();
+        if (WiFi.status() == WL_CONNECTED) {
+            lockState();
+            pruneRouteCache(now);
+            unlockState();
+
+            if (now - lastFetchMs >= ADSB_FETCH_INTERVAL_MS) {
+                lastFetchMs = now;
+                fetchAdsb();
+            }
+
+            serviceRouteLookup();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void startNetworkTask() {
+    if (networkTaskHandle != nullptr) {
+        return;
+    }
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        networkTaskMain,
+        "plane-net",
+        12288,
+        nullptr,
+        1,
+        &networkTaskHandle,
+        0
+    );
+    if (ok == pdPASS) {
+        Serial.println("[task] network task created on core 0");
+    } else {
+        Serial.println("[task] network task create failed");
+    }
+    Serial.flush();
+}
+
 static void initPalette() {
     colorBg = screen.color565(2, 8, 7);
     colorGrid = screen.color565(8, 46, 33);
@@ -1289,6 +1404,10 @@ void setup() {
         delay(20);
     }
     delay(250);
+    stateMutex = xSemaphoreCreateMutex();
+    if (stateMutex == nullptr) {
+        logLine("[task] state mutex create failed");
+    }
     logLine("\n=== Plane Radar Display DIAG ===");
     logStep("setup start");
     logStep("display begin");
@@ -1370,6 +1489,7 @@ void setup() {
     }
 
     logStep("drawRadar begin");
+    startNetworkTask();
     drawRadar();
     logStep("drawRadar end");
 }
@@ -1387,20 +1507,7 @@ void loop() {
         drawRadar();
     }
 
-    if (WiFi.status() == WL_CONNECTED && now - lastFetchMs >= ADSB_FETCH_INTERVAL_MS) {
-        lastFetchMs = now;
-        if (fetchAdsb()) {
-            drawRadar();
-        } else {
-            drawRadar();
-        }
-    }
-
-    if (WiFi.status() == WL_CONNECTED && serviceRouteLookup()) {
-        drawRadar();
-    }
-
-    if (aircraftCount > 0 && now - lastDrawMs >= RADAR_DRAW_INTERVAL_MS) {
+    if (shouldDrawRadarFrame(now)) {
         drawRadar();
     }
     delay(1);
