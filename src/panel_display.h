@@ -41,6 +41,7 @@ public:
     void setTextColor(uint16_t fg);
     void setTextColor(uint16_t fg, uint16_t bg);
     void setTextDatum(textdatum_t datum);
+    int textWidth(const char *text) const;
     int textWidth(const String &text) const;
     void drawString(const String &text, int x, int y);
     void drawString(const char *text, int x, int y);

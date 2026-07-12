@@ -108,15 +108,23 @@ struct RouteCacheEntry {
 static AppConfig config;
 static Aircraft aircraft[MAX_AIRCRAFT];
 static RouteCacheEntry routeCache[MAX_ROUTE_CACHE];
+static Aircraft renderAircraft[MAX_AIRCRAFT];
+static RouteCacheEntry renderRouteCache[MAX_ROUTE_CACHE];
 static size_t aircraftCount = 0;
 static String statusText = "BOOT";
 static String lastFetchText = "NO DATA";
 static bool portalActive = false;
 static bool mdnsStarted = false;
+static bool webServerStarted = false;
+static bool wifiReconnectInProgress = false;
+static bool wifiWasConnected = false;
+static bool forceAdsbFetch = false;
+static uint32_t wifiReconnectStartedMs = 0;
 static uint32_t lastReconnectMs = 0;
 static uint32_t lastFetchMs = 0;
 static uint32_t lastDrawMs = 0;
 static uint32_t lastRouteLookupMs = 0;
+static StaticSemaphore_t stateMutexStorage;
 static SemaphoreHandle_t stateMutex = nullptr;
 static TaskHandle_t networkTaskHandle = nullptr;
 static volatile bool networkDataDirty = false;
@@ -135,6 +143,16 @@ static void unlockState() {
     if (stateMutex != nullptr) {
         xSemaphoreGive(stateMutex);
     }
+}
+
+static void presentScreenOrRestart() {
+    if (screen.present()) {
+        return;
+    }
+    Serial.println("[display] unrecoverable framebuffer synchronization failure; restarting");
+    Serial.flush();
+    delay(100);
+    ESP.restart();
 }
 
 struct RangePreset {
@@ -216,29 +234,30 @@ static const char *rangeLabel() {
     return config.miles ? ranges[rangeIndex].miLabel : ranges[rangeIndex].kmLabel;
 }
 
-static String distanceLabel(float km) {
-    char out[12];
+static void formatDistanceLabel(float km, char *out, size_t outLen) {
+    if (outLen == 0) return;
     if (config.miles) {
-        snprintf(out, sizeof(out), "%.1fMI", km * 0.621371f);
+        snprintf(out, outLen, "%.1fMI", km * 0.621371f);
     } else {
-        snprintf(out, sizeof(out), "%.1fKM", km);
+        snprintf(out, outLen, "%.1fKM", km);
     }
-    return String(out);
 }
 
-static String speedLabel(float knots) {
+static void formatSpeedLabel(float knots, char *out, size_t outLen) {
+    if (outLen == 0) return;
+    out[0] = '\0';
     if (knots <= 1.0f) {
-        return "";
+        return;
     }
-    char out[10];
-    snprintf(out, sizeof(out), "%dKT", static_cast<int>(lroundf(knots)));
-    return String(out);
+    snprintf(out, outLen, "%dKT", static_cast<int>(lroundf(knots)));
 }
 
 static void setStatus(const String &text) {
+    lockState();
     statusText = text;
+    networkDataDirty = true;
+    unlockState();
     Serial.println("[status] " + text);
-    Serial.flush();
 }
 
 static const char *bootStatusLabel(BootStatus status) {
@@ -307,7 +326,7 @@ static void drawBootScreen() {
     screen.setTextSize(1);
     screen.setTextColor(bootDim, bootBg);
     screen.drawString("LONG PRESS SCREEN FOR SETUP", 54, 444);
-    screen.present();
+    presentScreenOrRestart();
 }
 
 static void resetBootScreen() {
@@ -332,7 +351,7 @@ static void drawBootSetupHint(const char *text, uint16_t color) {
     screen.setTextSize(1);
     screen.setTextColor(color, bootBg);
     screen.drawString(text, 54, 444);
-    screen.present();
+    presentScreenOrRestart();
 }
 
 static void startPortal();
@@ -449,7 +468,7 @@ static void drawStatusScreen(const String &title, const String &body) {
     screen.setTextColor(TFT_WHITE, TFT_BLACK);
     screen.setTextSize(2);
     screen.drawString(body, 28, 84);
-    screen.present();
+    presentScreenOrRestart();
 }
 
 static void drawDisplayDiagnostics() {
@@ -458,13 +477,13 @@ static void drawDisplayDiagnostics() {
     Serial.flush();
 
     screen.fillScreen(TFT_RED);
-    screen.present();
+    presentScreenOrRestart();
     delay(350);
     screen.fillScreen(TFT_GREEN);
-    screen.present();
+    presentScreenOrRestart();
     delay(350);
     screen.fillScreen(TFT_BLUE);
-    screen.present();
+    presentScreenOrRestart();
     delay(350);
     screen.fillScreen(TFT_BLACK);
     screen.setTextDatum(textdatum_t::top_left);
@@ -474,7 +493,7 @@ static void drawDisplayDiagnostics() {
     screen.setTextSize(2);
     screen.setTextColor(TFT_WHITE, TFT_BLACK);
     screen.drawString("IF YOU SEE THIS, DISPLAY INIT WORKS.", 24, 82);
-    screen.present();
+    presentScreenOrRestart();
     delay(900);
     logStep("display diagnostics end");
 }
@@ -562,13 +581,22 @@ static void handleScreenshot() {
 }
 
 static void handleSave() {
-    config.ssid = server.arg("ssid");
-    config.password = server.arg("pass");
-    config.lat = server.arg("lat").toDouble();
-    config.lon = server.arg("lon").toDouble();
-    config.miles = server.hasArg("miles");
-    config.showRunways = server.hasArg("runways");
+    String ssid = server.arg("ssid");
+    String password = server.arg("pass");
+    double lat = server.arg("lat").toDouble();
+    double lon = server.arg("lon").toDouble();
+    bool miles = server.hasArg("miles");
+    bool showRunways = server.hasArg("runways");
+
+    lockState();
+    config.ssid = ssid;
+    config.password = password;
+    config.lat = lat;
+    config.lon = lon;
+    config.miles = miles;
+    config.showRunways = showRunways;
     saveConfig();
+    unlockState();
     server.send(200, "text/html", "<html><body><h1>Saved</h1><p>Rebooting...</p></body></html>");
     delay(500);
     ESP.restart();
@@ -580,21 +608,30 @@ static void handleNotFound() {
 }
 
 static void startWebServer() {
+    if (webServerStarted) {
+        return;
+    }
     server.on("/", HTTP_GET, handleRoot);
     server.on("/screenshot", HTTP_GET, handleScreenshot);
     server.on("/screenshot.bmp", HTTP_GET, handleScreenshot);
     server.on("/save", HTTP_POST, handleSave);
     server.onNotFound(handleNotFound);
     server.begin();
+    webServerStarted = true;
 }
 
 static void startPortal() {
-    if (portalActive) {
+    lockState();
+    bool alreadyActive = portalActive;
+    if (!alreadyActive) {
+        portalActive = true;
+    }
+    unlockState();
+    if (alreadyActive) {
         return;
     }
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("PlaneRadar-Setup");
-    portalActive = true;
     startWebServer();
     if (!mdnsStarted && MDNS.begin("plane-radar")) {
         mdnsStarted = true;
@@ -624,9 +661,68 @@ static bool connectWifiOnce(uint32_t timeoutMs) {
     if (!portalActive) {
         startWebServer();
     }
+    wifiWasConnected = true;
+    wifiReconnectInProgress = false;
     Serial.printf("[wifi] connected ip=%s rssi=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
     setStatus("WIFI OK " + WiFi.localIP().toString());
     return true;
+}
+
+static void serviceWifiReconnect(uint32_t now) {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!wifiWasConnected) {
+            wifiWasConnected = true;
+            wifiReconnectInProgress = false;
+            lockState();
+            forceAdsbFetch = true;
+            unlockState();
+            setStatus("WIFI OK " + WiFi.localIP().toString());
+            Serial.printf("[wifi] reconnected ip=%s rssi=%d\n",
+                          WiFi.localIP().toString().c_str(),
+                          WiFi.RSSI());
+        }
+        return;
+    }
+
+    wifiWasConnected = false;
+    lockState();
+    bool canReconnect = config.configured && config.ssid.length() > 0;
+    unlockState();
+    if (!canReconnect) {
+        return;
+    }
+
+    if (wifiReconnectInProgress) {
+        if (now - wifiReconnectStartedMs < WIFI_CONNECT_ATTEMPT_MS) {
+            return;
+        }
+        WiFi.disconnect(false, false);
+        wifiReconnectInProgress = false;
+        lastReconnectMs = now;
+        setStatus("WIFI RETRY");
+        return;
+    }
+
+    if (now - lastReconnectMs < WIFI_RECONNECT_INTERVAL_MS) {
+        return;
+    }
+
+    String ssid;
+    String password;
+    bool keepPortal = false;
+    lockState();
+    ssid = config.ssid;
+    password = config.password;
+    keepPortal = portalActive;
+    unlockState();
+
+    WiFi.mode(keepPortal ? WIFI_AP_STA : WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    wifiReconnectInProgress = true;
+    wifiReconnectStartedMs = now;
+    lastReconnectMs = now;
+    setStatus("WIFI CONNECTING");
 }
 
 static bool readJsonFloat(const JsonObject &obj, const char *key, float &out) {
@@ -833,11 +929,20 @@ static bool lookupRouteForCallsign(RouteCacheEntry &entry) {
         return false;
     }
 
-    String payload = http.getString();
-    http.end();
-
+    JsonDocument filter;
+    filter["response"]["flightroute"]["origin"]["iata_code"] = true;
+    filter["response"]["flightroute"]["origin"]["iata"] = true;
+    filter["response"]["flightroute"]["origin"]["iataCode"] = true;
+    filter["response"]["flightroute"]["destination"]["iata_code"] = true;
+    filter["response"]["flightroute"]["destination"]["iata"] = true;
+    filter["response"]["flightroute"]["destination"]["iataCode"] = true;
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload);
+    DeserializationError err = deserializeJson(
+        doc,
+        http.getStream(),
+        DeserializationOption::Filter(filter)
+    );
+    http.end();
     if (err) {
         return false;
     }
@@ -919,28 +1024,53 @@ static bool serviceRouteLookup() {
     return ok;
 }
 
+static const RouteCacheEntry *findRouteCacheEntryIn(
+    const RouteCacheEntry *entries,
+    size_t entryCount,
+    const char *callsign
+) {
+    for (size_t i = 0; i < entryCount; i++) {
+        if (entries[i].active && strcmp(entries[i].callsign, callsign) == 0) {
+            return &entries[i];
+        }
+    }
+    return nullptr;
+}
+
 template <typename Gfx>
-static String routeLabelForCallsign(Gfx &g, const char *callsign, int maxWidth) {
+static bool routeLabelForCallsign(
+    Gfx &g,
+    const RouteCacheEntry *entries,
+    size_t entryCount,
+    const char *callsign,
+    int maxWidth,
+    char *out,
+    size_t outLen
+) {
+    if (outLen == 0) return false;
+    out[0] = '\0';
     char normalized[10];
     if (!normalizeCallsign(callsign, normalized, sizeof(normalized))) {
-        return "";
+        return false;
     }
 
-    RouteCacheEntry *entry = findRouteCacheEntry(normalized);
+    const RouteCacheEntry *entry = findRouteCacheEntryIn(entries, entryCount, normalized);
     if (entry == nullptr || !entry->hasRoute) {
-        return "";
+        return false;
     }
 
     const char *originCity = cityForIata(entry->originIata);
     const char *destinationCity = cityForIata(entry->destinationIata);
-    String route = String(originCity != nullptr ? originCity : entry->originIata) +
-                   " - " +
-                   String(destinationCity != nullptr ? destinationCity : entry->destinationIata);
+    snprintf(out,
+             outLen,
+             "%s - %s",
+             originCity != nullptr ? originCity : entry->originIata,
+             destinationCity != nullptr ? destinationCity : entry->destinationIata);
 
-    if (g.textWidth(route) <= maxWidth) {
-        return route;
+    if (g.textWidth(out) > maxWidth) {
+        snprintf(out, outLen, "%s - %s", entry->originIata, entry->destinationIata);
     }
-    return String(entry->originIata) + " - " + entry->destinationIata;
+    return out[0] != '\0';
 }
 
 static void formatAltitude(const JsonObject &plane, char *out, size_t outLen) {
@@ -985,11 +1115,20 @@ static bool fetchAdsb() {
         return false;
     }
 
-    float fetchNm = (activeOuterKm() * 1.25f) / KM_PER_NM;
+    double centerLat = 0;
+    double centerLon = 0;
+    float outerKm = 0;
+    lockState();
+    centerLat = config.lat;
+    centerLon = config.lon;
+    outerKm = activeOuterKm();
+    unlockState();
+
+    float fetchNm = (outerKm * 1.25f) / KM_PER_NM;
     String url = "https://opendata.adsb.fi/api/v3/lat/";
-    url += String(config.lat, 6);
+    url += String(centerLat, 6);
     url += "/lon/";
-    url += String(config.lon, 6);
+    url += String(centerLon, 6);
     url += "/dist/";
     url += String(fetchNm, 1);
 
@@ -1008,11 +1147,22 @@ static bool fetchAdsb() {
         return false;
     }
 
-    String payload = http.getString();
-    http.end();
-
+    JsonDocument filter;
+    const char *fields[] = {
+        "lat", "lon", "track", "true_heading", "mag_heading", "dir",
+        "gs", "tas", "ias", "baro_rate", "geom_rate", "flight", "hex",
+        "t", "category", "squawk", "alt_baro", "alt_geom"
+    };
+    for (const char *field : fields) {
+        filter["ac"][0][field] = true;
+    }
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload);
+    DeserializationError err = deserializeJson(
+        doc,
+        http.getStream(),
+        DeserializationOption::Filter(filter)
+    );
+    http.end();
     if (err) {
         setLastFetchText("JSON ERROR");
         return false;
@@ -1054,17 +1204,19 @@ static bool fetchAdsb() {
         }
     }
 
+    char fetchStatus[24];
+    snprintf(fetchStatus, sizeof(fetchStatus), "%u AIRCRAFT", static_cast<unsigned>(fetchedCount));
     lockState();
     if (fetchedCount > 0) {
         memcpy(aircraft, fetchedAircraft, fetchedCount * sizeof(Aircraft));
     }
     aircraftCount = fetchedCount;
     syncRouteCacheFromAircraft(fetchNow);
-    lastFetchText = String(aircraftCount) + " AIRCRAFT";
+    lastFetchText = fetchStatus;
     networkDataDirty = true;
     unlockState();
 
-    Serial.println("[adsb] " + lastFetchText);
+    Serial.printf("[adsb] %s\n", fetchStatus);
     return true;
 }
 
@@ -1111,19 +1263,19 @@ static void extrapolatedPosition(const Aircraft &item, uint32_t now, float &lat,
     lon = item.lon + eastKm / lonScale;
 }
 
-static void prepareAircraftGeometry() {
+static void prepareAircraftGeometry(Aircraft *items, size_t itemCount) {
     uint32_t now = millis();
-    for (size_t i = 0; i < aircraftCount; i++) {
-        extrapolatedPosition(aircraft[i], now, aircraft[i].renderLat, aircraft[i].renderLon);
-        aircraft[i].inside = toRadarPoint(
-            aircraft[i].renderLat,
-            aircraft[i].renderLon,
-            aircraft[i].screenX,
-            aircraft[i].screenY,
-            aircraft[i].distanceKm
+    for (size_t i = 0; i < itemCount; i++) {
+        extrapolatedPosition(items[i], now, items[i].renderLat, items[i].renderLon);
+        items[i].inside = toRadarPoint(
+            items[i].renderLat,
+            items[i].renderLon,
+            items[i].screenX,
+            items[i].screenY,
+            items[i].distanceKm
         );
     }
-    std::sort(aircraft, aircraft + aircraftCount, [](const Aircraft &a, const Aircraft &b) {
+    std::sort(items, items + itemCount, [](const Aircraft &a, const Aircraft &b) {
         return a.distanceKm > b.distanceKm;
     });
 }
@@ -1213,31 +1365,51 @@ static void drawRunways(Gfx &g) {
 }
 
 template <typename Gfx>
-static void appendTokenIfFits(Gfx &g, String &line, const String &token, int maxWidth) {
-    if (token.length() == 0) return;
-    String next = line;
-    if (next.length() > 0) next += " ";
-    next += token;
-    if (g.textWidth(next) <= maxWidth) {
-        line = next;
+static void appendTokenIfFits(
+    Gfx &g,
+    char *line,
+    size_t lineLen,
+    const char *token,
+    int maxWidth
+) {
+    if (lineLen == 0 || token == nullptr || token[0] == '\0') return;
+    size_t originalLen = strlen(line);
+    size_t separatorLen = originalLen > 0 ? 1 : 0;
+    if (originalLen + separatorLen + strlen(token) >= lineLen) return;
+    if (separatorLen > 0) {
+        line[originalLen++] = ' ';
+        line[originalLen] = '\0';
+    }
+    strlcat(line, token, lineLen);
+    if (g.textWidth(line) > maxWidth) {
+        line[originalLen - separatorLen] = '\0';
     }
 }
 
 template <typename Gfx>
-static void drawAircraftList(Gfx &g) {
+static void drawAircraftList(
+    Gfx &g,
+    const Aircraft *items,
+    size_t itemCount,
+    const RouteCacheEntry *routes,
+    size_t routeCount,
+    const char *emptyStatus
+) {
     g.fillRect(PANEL_X, 0, SCREEN_W - PANEL_X, SCREEN_H, colorBg);
     g.drawWideLine(PANEL_X - 8, 18, PANEL_X - 8, SCREEN_H - 18, 1.0f, colorGrid);
 
     g.setTextDatum(textdatum_t::top_right);
     g.setTextSize(2);
     g.setTextColor(colorDim, colorBg);
-    g.drawString(String("RANGE ") + rangeLabel(), PANEL_RIGHT, 10);
+    char rangeTitle[24];
+    snprintf(rangeTitle, sizeof(rangeTitle), "RANGE %s", rangeLabel());
+    g.drawString(rangeTitle, PANEL_RIGHT, 10);
 
     int textWidth = PANEL_RIGHT - PANEL_TEXT_X;
     int maxRows = (SCREEN_H - PANEL_LIST_TOP - 4) / PANEL_ROW_H;
     int drawn = 0;
-    for (int idx = static_cast<int>(aircraftCount) - 1; idx >= 0 && drawn < maxRows; idx--) {
-        const Aircraft &item = aircraft[idx];
+    for (int idx = static_cast<int>(itemCount) - 1; idx >= 0 && drawn < maxRows; idx--) {
+        const Aircraft &item = items[idx];
         int rowY = PANEL_LIST_TOP + drawn * PANEL_ROW_H;
         int iconX = PANEL_X + 20;
         int iconY = rowY + 23;
@@ -1250,23 +1422,29 @@ static void drawAircraftList(Gfx &g) {
         g.drawString(item.callsign[0] ? item.callsign : "????", PANEL_TEXT_X, rowY);
 
         g.setTextSize(1);
-        String detail;
-        appendTokenIfFits(g, detail, item.type, textWidth);
-        appendTokenIfFits(g, detail, distanceLabel(item.distanceKm), textWidth);
-        appendTokenIfFits(g, detail, item.alt[0] ? String(item.alt) : String("ALT --"), textWidth);
-        appendTokenIfFits(g, detail, item.vsi, textWidth);
-        appendTokenIfFits(g, detail, speedLabel(item.gsKnots), textWidth);
+        char detail[96] = {};
+        char distance[16];
+        char speed[16];
+        formatDistanceLabel(item.distanceKm, distance, sizeof(distance));
+        formatSpeedLabel(item.gsKnots, speed, sizeof(speed));
+        appendTokenIfFits(g, detail, sizeof(detail), item.type, textWidth);
+        appendTokenIfFits(g, detail, sizeof(detail), distance, textWidth);
+        appendTokenIfFits(g, detail, sizeof(detail), item.alt[0] ? item.alt : "ALT --", textWidth);
+        appendTokenIfFits(g, detail, sizeof(detail), item.vsi, textWidth);
+        appendTokenIfFits(g, detail, sizeof(detail), speed, textWidth);
         g.setTextColor(colorDim, colorBg);
         g.drawString(detail, PANEL_TEXT_X, rowY + 20);
 
         const char *squawkAlert = squawkAlertLabel(item.squawk);
         if (squawkAlert != nullptr) {
-            String alert = String(item.squawk) + " " + squawkAlert;
+            char alert[32];
+            snprintf(alert, sizeof(alert), "%s %s", item.squawk, squawkAlert);
             g.setTextColor(colorWarn, colorBg);
             g.drawString(alert, PANEL_TEXT_X, rowY + 32);
         } else {
-            String route = routeLabelForCallsign(g, item.callsign, textWidth);
-            if (route.length() > 0) {
+            char route[64];
+            if (routeLabelForCallsign(
+                    g, routes, routeCount, item.callsign, textWidth, route, sizeof(route))) {
                 g.setTextColor(colorRunway, colorBg);
                 g.drawString(route, PANEL_TEXT_X, rowY + 32);
             }
@@ -1280,30 +1458,40 @@ static void drawAircraftList(Gfx &g) {
         g.setTextDatum(textdatum_t::top_left);
         g.setTextSize(1);
         g.setTextColor(colorDim, colorBg);
-        g.drawString(WiFi.status() == WL_CONNECTED ? "NO AIRCRAFT" : statusText, PANEL_TEXT_X, PANEL_LIST_TOP);
+        g.drawString(WiFi.status() == WL_CONNECTED ? "NO AIRCRAFT" : emptyStatus, PANEL_TEXT_X, PANEL_LIST_TOP);
     }
 }
 
 static void drawRadar() {
     static uint32_t drawCounter = 0;
     drawCounter++;
+
+    size_t renderCount = 0;
+    char emptyStatus[64];
     lockState();
+    renderCount = aircraftCount;
+    if (renderCount > 0) {
+        memcpy(renderAircraft, aircraft, renderCount * sizeof(Aircraft));
+    }
+    memcpy(renderRouteCache, routeCache, sizeof(renderRouteCache));
+    strlcpy(emptyStatus, statusText.c_str(), sizeof(emptyStatus));
+    unlockState();
+
     bool logDraw = drawCounter <= 3 || drawCounter % 120 == 0;
     if (logDraw) {
         Serial.printf("[draw] #%lu begin aircraft=%u wifi=%d w=%d h=%d free_heap=%u free_psram=%u\n",
                       static_cast<unsigned long>(drawCounter),
-                      static_cast<unsigned>(aircraftCount),
+                      static_cast<unsigned>(renderCount),
                       WiFi.status(),
                       screen.width(),
                       screen.height(),
                       static_cast<unsigned>(ESP.getFreeHeap()),
                       static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
-        Serial.flush();
     }
     auto &g = screen;
     g.startWrite();
     g.fillScreen(colorBg);
-    prepareAircraftGeometry();
+    prepareAircraftGeometry(renderAircraft, renderCount);
     int cx = RADAR_CX;
     int cy = RADAR_CY;
     int radius = RADAR_RADIUS;
@@ -1331,14 +1519,14 @@ static void drawRadar() {
 
     drawRunways(g);
 
-    for (size_t i = 0; i < aircraftCount; i++) {
-        int x = aircraft[i].screenX;
-        int y = aircraft[i].screenY;
-        if (!aircraft[i].inside) {
+    for (size_t i = 0; i < renderCount; i++) {
+        int x = renderAircraft[i].screenX;
+        int y = renderAircraft[i].screenY;
+        if (!renderAircraft[i].inside) {
             float dxKm = 0;
             float dyKm = 0;
             float distKm = 0;
-            offsetKm(aircraft[i].renderLat, aircraft[i].renderLon, dxKm, dyKm, distKm);
+            offsetKm(renderAircraft[i].renderLat, renderAircraft[i].renderLon, dxKm, dyKm, distKm);
             if (distKm < 0.01f) continue;
             float ang = atan2f(dxKm, dyKm);
             x = cx + lroundf(sinf(ang) * (radius + 12));
@@ -1347,44 +1535,54 @@ static void drawRadar() {
             continue;
         }
         if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) continue;
-        drawAircraftSymbol(g, aircraft[i], x, y);
+        drawAircraftSymbol(g, renderAircraft[i], x, y);
     }
 
     g.setTextSize(1);
-    for (size_t i = 0; i < aircraftCount; i++) {
-        if (!aircraft[i].inside) continue;
-        int x = aircraft[i].screenX;
-        int y = aircraft[i].screenY;
+    for (size_t i = 0; i < renderCount; i++) {
+        if (!renderAircraft[i].inside) continue;
+        int x = renderAircraft[i].screenX;
+        int y = renderAircraft[i].screenY;
         if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) continue;
         bool labelRight = x < cx;
         int tx = labelRight ? x + 16 : x - 16;
         int ty = std::max(10, std::min(SCREEN_H - 28, y - 10));
         g.setTextDatum(labelRight ? textdatum_t::top_left : textdatum_t::top_right);
         g.setTextColor(colorText, colorBg);
-        g.drawString(aircraft[i].callsign[0] ? aircraft[i].callsign : "????", tx, ty);
+        g.drawString(renderAircraft[i].callsign[0] ? renderAircraft[i].callsign : "????", tx, ty);
         g.setTextColor(colorDim, colorBg);
-        g.drawString(aircraft[i].type, tx, ty + 9);
+        g.drawString(renderAircraft[i].type, tx, ty + 9);
         g.setTextColor(colorWarn, colorBg);
-        String altitudeLine = aircraft[i].alt;
-        if (aircraft[i].vsi[0] != '\0') {
-            altitudeLine += " ";
-            altitudeLine += aircraft[i].vsi;
-        }
+        char altitudeLine[32];
+        snprintf(altitudeLine,
+                 sizeof(altitudeLine),
+                 "%s%s%s",
+                 renderAircraft[i].alt,
+                 renderAircraft[i].vsi[0] != '\0' ? " " : "",
+                 renderAircraft[i].vsi);
         g.drawString(altitudeLine, tx, ty + 18);
     }
 
-    drawAircraftList(g);
+    drawAircraftList(
+        g,
+        renderAircraft,
+        renderCount,
+        renderRouteCache,
+        MAX_ROUTE_CACHE,
+        emptyStatus
+    );
 
     g.endWrite();
-    g.present();
-    lastDrawMs = millis();
+    presentScreenOrRestart();
+    uint32_t completedAt = millis();
+    lockState();
+    lastDrawMs = completedAt;
+    unlockState();
     if (logDraw) {
         Serial.printf("[draw] #%lu end at=%lu\n",
                       static_cast<unsigned long>(drawCounter),
-                      static_cast<unsigned long>(lastDrawMs));
-        Serial.flush();
+                      static_cast<unsigned long>(completedAt));
     }
-    unlockState();
 }
 
 static void handleTouch() {
@@ -1403,15 +1601,16 @@ static void handleTouch() {
     if (down && !longPressHandled && !configNoticeShown && now - touchDownMs >= CONFIG_HOLD_NOTICE_MS) {
         configNoticeShown = true;
         setStatus("HOLD FOR SETUP");
-        drawRadar();
     }
     if (!down && touchWasDown) {
         uint32_t held = now - touchDownMs;
         if (!longPressHandled && held >= TOUCH_TAP_MIN_MS && held < TOUCH_LONG_PRESS_MS) {
+            lockState();
             rangeIndex = (rangeIndex + 1) % RANGE_COUNT;
+            forceAdsbFetch = true;
+            networkDataDirty = true;
+            unlockState();
             saveRange();
-            lastFetchMs = 0;
-            drawRadar();
         }
     }
     if (!down) {
@@ -1439,14 +1638,18 @@ static void networkTaskMain(void *) {
 
     while (true) {
         uint32_t now = millis();
+        serviceWifiReconnect(now);
         if (WiFi.status() == WL_CONNECTED) {
+            bool fetchNow = false;
             lockState();
-            pruneRouteCache(now);
+            if (forceAdsbFetch) {
+                forceAdsbFetch = false;
+                fetchNow = true;
+            }
             unlockState();
-
-            if (now - lastFetchMs >= ADSB_FETCH_INTERVAL_MS) {
-                lastFetchMs = now;
+            if (fetchNow || now - lastFetchMs >= ADSB_FETCH_INTERVAL_MS) {
                 fetchAdsb();
+                lastFetchMs = millis();
             }
 
             serviceRouteLookup();
@@ -1495,9 +1698,12 @@ void setup() {
         delay(20);
     }
     delay(250);
-    stateMutex = xSemaphoreCreateMutex();
+    stateMutex = xSemaphoreCreateMutexStatic(&stateMutexStorage);
     if (stateMutex == nullptr) {
         logLine("[task] state mutex create failed");
+        while (true) {
+            delay(1000);
+        }
     }
     logLine("\n=== Plane Radar Display DIAG ===");
     logStep("setup start");
@@ -1573,6 +1779,7 @@ void setup() {
         setupMode = waitForBootSetupHold(BOOT_SETUP_WINDOW_MS);
     }
     bootScreenActive = false;
+    startNetworkTask();
     if (setupMode || portalActive) {
         logStep("setup portal active");
         drawStatusScreen("PLANE RADAR SETUP", "Connect to Wi-Fi AP: PlaneRadar-Setup\nOpen http://192.168.4.1\nSet Wi-Fi and radar location.");
@@ -1580,7 +1787,6 @@ void setup() {
     }
 
     logStep("drawRadar begin");
-    startNetworkTask();
     drawRadar();
     logStep("drawRadar end");
 }
@@ -1590,14 +1796,6 @@ void loop() {
     handleTouch();
 
     uint32_t now = millis();
-    pruneRouteCache(now);
-    if (WiFi.status() != WL_CONNECTED && config.configured && now - lastReconnectMs >= WIFI_RECONNECT_INTERVAL_MS) {
-        lastReconnectMs = now;
-        setStatus("WIFI RECONNECT");
-        connectWifiOnce(WIFI_CONNECT_ATTEMPT_MS);
-        drawRadar();
-    }
-
     if (shouldDrawRadarFrame(now)) {
         drawRadar();
     }
