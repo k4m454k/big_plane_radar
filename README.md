@@ -36,6 +36,15 @@ appears as `/dev/ttyACM*` or `/dev/ttyUSB*`; the user may need access to the
 - local dead-reckoning between ADS-B updates, redrawn at about `4 FPS`;
 - optional route city line in the aircraft list via cached callsign lookups from
   `https://api.adsbdb.com/`;
+- optional Stadia Maps `Alidade Smooth Dark` raster background, with a complete
+  no-map fallback;
+- all four map ranges are downloaded once during boot and cached in PSRAM, so
+  changing radar range performs no additional Stadia request;
+- downloaded maps are bilinearly downsampled to the display for smoother roads
+  and boundaries;
+- with a map loaded, aircraft use the full rectangular map viewport and
+  out-of-view targets become direction dots on its edge; without a map, the
+  original circular radar boundary remains unchanged;
 - background Wi-Fi reconnect after router/power outages;
 - touch controls: short tap cycles range, long press starts the setup portal;
 - boot setup window: hold the screen during startup to force the setup portal;
@@ -57,13 +66,16 @@ Aircraft symbols use ADS-B `category` when it is available.
 ├── build_arduino_cli.sh
 ├── esp_panel_board_custom_conf.h
 ├── lib/
-│   └── ArduinoJson/
+│   ├── ArduinoJson/
+│   └── PNGdec/
 ├── releases/
 ├── scripts/
 │   └── build_iata_airports.py
 ├── src/
 │   ├── airports.h
 │   ├── airports_iata.h
+│   ├── map_background.cpp
+│   ├── map_background.h
 │   ├── main.cpp
 │   ├── panel_display.cpp
 │   └── panel_display.h
@@ -118,6 +130,26 @@ DEFAULT_WIFI_SSID="YourNetwork" \
 DEFAULT_WIFI_PASSWORD="YourPassword" \
 bash build_arduino_cli.sh
 ```
+
+The map background is disabled by default. To make Stadia the first-boot
+default for a private build:
+
+```sh
+DEFAULT_MAP_PROVIDER=stadia \
+DEFAULT_STADIA_API_KEY="YourStadiaApiKey" \
+bash build_arduino_cli.sh
+```
+
+Do not commit API keys. Public builds should keep the default
+`DEFAULT_MAP_PROVIDER=none`; the provider and key can also be set later in the
+device setup page and are stored in NVS. If the key is empty or a map request
+fails, the radar continues on its normal plain background.
+
+When Stadia is enabled, boot downloads one image for each of the four range
+presets. The images remain in PSRAM until restart. They are refreshed only on
+the next boot, including after changing the radar coordinates in setup. The
+boot screen reports map progress as `1/4` through `4/4`; it shows `SKIP` when
+maps are disabled and `NO KEY` when Stadia is selected without a key.
 
 ## Upload
 
@@ -204,8 +236,14 @@ After the board joins your Wi-Fi, the setup page is also available at:
 http://plane-radar.local
 ```
 
-Set Wi-Fi, radar center coordinates, units, and runway overlay there. The board
-reboots after saving.
+Set Wi-Fi, radar center coordinates, units, runway overlay, and optional map
+background there. Select `None` for the original plain radar, or select
+`Stadia Alidade Smooth Dark` and enter a Stadia Maps API key. The board reboots
+after saving.
+
+The firmware uses the Stadia Maps Static Maps API and preserves the attribution
+rendered into the returned map image. See the official
+[Stadia Maps static map documentation](https://docs.stadiamaps.com/static-maps/).
 
 ## Screenshot
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <ctype.h>
+#include <cstring>
 #include <esp_display_panel.hpp>
 #include <esp_heap_caps.h>
 #include <math.h>
@@ -380,6 +381,32 @@ void Canvas::fillTriangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16
                 drawPixel(x, y, color);
             }
         }
+    }
+}
+
+void Canvas::blitRGB565(int x, int y, int w, int h, const uint16_t *pixels, int stride) {
+    if (_fb == nullptr || pixels == nullptr || w <= 0 || h <= 0 || stride < w) return;
+
+    int srcX = 0;
+    int srcY = 0;
+    if (x < 0) {
+        srcX = -x;
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        srcY = -y;
+        h += y;
+        y = 0;
+    }
+    w = std::min(w, WIDTH - x);
+    h = std::min(h, HEIGHT - y);
+    if (w <= 0 || h <= 0) return;
+
+    for (int row = 0; row < h; row++) {
+        const uint16_t *src = pixels + static_cast<size_t>(srcY + row) * stride + srcX;
+        uint16_t *dst = _fb + static_cast<size_t>(y + row) * WIDTH + x;
+        memcpy(dst, src, static_cast<size_t>(w) * sizeof(uint16_t));
     }
 }
 

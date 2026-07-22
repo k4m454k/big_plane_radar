@@ -2,6 +2,7 @@
 build/
 *.pyc
 __pycache__/
+.serena/
 
 # Keep release binaries explicit.
 !releases/

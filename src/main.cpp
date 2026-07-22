@@ -13,6 +13,7 @@
 
 #include "airports.h"
 #include "airports_iata.h"
+#include "map_background.h"
 #include "panel_display.h"
 
 #ifndef DEFAULT_WIFI_SSID
@@ -27,6 +28,17 @@
 #ifndef DEFAULT_LON
 #define DEFAULT_LON -0.127800
 #endif
+#ifndef DEFAULT_MAP_PROVIDER
+#define DEFAULT_MAP_PROVIDER 0
+#endif
+#ifndef DEFAULT_STADIA_API_KEY
+#define DEFAULT_STADIA_API_KEY ""
+#endif
+
+enum class MapProvider : uint8_t {
+    None = 0,
+    Stadia = 1,
+};
 
 static constexpr int SCREEN_W = 800;
 static constexpr int SCREEN_H = 480;
@@ -34,6 +46,7 @@ static constexpr int RADAR_CX = 260;
 static constexpr int RADAR_CY = SCREEN_H / 2;
 static constexpr int RADAR_RADIUS = 218;
 static constexpr int PANEL_X = 520;
+static constexpr int MAP_EDGE_MARKER_MARGIN = 5;
 static constexpr int PANEL_PAD = 10;
 static constexpr int PANEL_TEXT_X = PANEL_X + 42;
 static constexpr int PANEL_RIGHT = SCREEN_W - 10;
@@ -68,6 +81,10 @@ struct AppConfig {
     double lon = DEFAULT_LON;
     bool miles = false;
     bool showRunways = true;
+    MapProvider mapProvider = DEFAULT_MAP_PROVIDER == 1
+        ? MapProvider::Stadia
+        : MapProvider::None;
+    String stadiaApiKey = DEFAULT_STADIA_API_KEY;
     bool configured = false;
 };
 
@@ -119,6 +136,7 @@ static bool webServerStarted = false;
 static bool wifiReconnectInProgress = false;
 static bool wifiWasConnected = false;
 static bool forceAdsbFetch = false;
+static bool mapRuntimeReady = false;
 static uint32_t wifiReconnectStartedMs = 0;
 static uint32_t lastReconnectMs = 0;
 static uint32_t lastFetchMs = 0;
@@ -184,6 +202,7 @@ enum class BootStatus : uint8_t {
     Ok,
     Fail,
     Skip,
+    NoKey,
 };
 
 enum BootStageId : uint8_t {
@@ -191,6 +210,7 @@ enum BootStageId : uint8_t {
     BOOT_PALETTE,
     BOOT_CONFIG,
     BOOT_WIFI,
+    BOOT_MAP,
     BOOT_SERVICES,
     BOOT_DATA,
     BOOT_INTERFACE,
@@ -200,16 +220,18 @@ enum BootStageId : uint8_t {
 struct BootStage {
     const char *label;
     BootStatus status;
+    char detail[12];
 };
 
 static BootStage bootStages[BOOT_STAGE_COUNT] = {
-    {"LCD INIT", BootStatus::Pending},
-    {"PALETTE", BootStatus::Pending},
-    {"CONFIG LOAD", BootStatus::Pending},
-    {"WIFI CONNECTION", BootStatus::Pending},
-    {"WEB SERVICES", BootStatus::Pending},
-    {"ADSB DATA", BootStatus::Pending},
-    {"INTERFACE", BootStatus::Pending},
+    {"LCD INIT", BootStatus::Pending, {}},
+    {"PALETTE", BootStatus::Pending, {}},
+    {"CONFIG LOAD", BootStatus::Pending, {}},
+    {"WIFI CONNECTION", BootStatus::Pending, {}},
+    {"MAP CACHE", BootStatus::Pending, {}},
+    {"WEB SERVICES", BootStatus::Pending, {}},
+    {"ADSB DATA", BootStatus::Pending, {}},
+    {"INTERFACE", BootStatus::Pending, {}},
 };
 static bool bootScreenActive = false;
 
@@ -266,6 +288,7 @@ static const char *bootStatusLabel(BootStatus status) {
     case BootStatus::Ok: return "OK";
     case BootStatus::Fail: return "FAIL";
     case BootStatus::Skip: return "SKIP";
+    case BootStatus::NoKey: return "NO KEY";
     case BootStatus::Pending:
     default: return "WAIT";
     }
@@ -277,6 +300,7 @@ static uint16_t bootStatusColor(BootStatus status) {
     case BootStatus::Ok: return screen.color565(68, 255, 122);
     case BootStatus::Fail: return screen.color565(255, 75, 90);
     case BootStatus::Skip: return screen.color565(80, 130, 105);
+    case BootStatus::NoKey: return screen.color565(255, 180, 70);
     case BootStatus::Pending:
     default: return screen.color565(70, 100, 85);
     }
@@ -300,7 +324,7 @@ static void drawBootStageLine(const BootStage &stage, int y) {
     }
 
     screen.setTextColor(bootStatusColor(stage.status), bootBg);
-    screen.drawString(bootStatusLabel(stage.status), statusX, y);
+    screen.drawString(stage.detail[0] != '\0' ? stage.detail : bootStatusLabel(stage.status), statusX, y);
 }
 
 static void drawBootScreen() {
@@ -320,7 +344,7 @@ static void drawBootScreen() {
     screen.drawWideLine(54, 122, 746, 122, 1.0f, bootLine);
 
     for (uint8_t i = 0; i < BOOT_STAGE_COUNT; i++) {
-        drawBootStageLine(bootStages[i], 146 + i * 40);
+        drawBootStageLine(bootStages[i], 142 + i * 36);
     }
 
     screen.setTextSize(1);
@@ -332,16 +356,67 @@ static void drawBootScreen() {
 static void resetBootScreen() {
     for (uint8_t i = 0; i < BOOT_STAGE_COUNT; i++) {
         bootStages[i].status = BootStatus::Pending;
+        bootStages[i].detail[0] = '\0';
     }
     bootScreenActive = true;
     drawBootScreen();
 }
 
-static void setBootStage(BootStageId id, BootStatus status) {
+static void setBootStage(BootStageId id, BootStatus status, const char *detail = nullptr) {
     bootStages[id].status = status;
+    if (detail != nullptr) {
+        strlcpy(bootStages[id].detail, detail, sizeof(bootStages[id].detail));
+    } else {
+        bootStages[id].detail[0] = '\0';
+    }
     if (bootScreenActive) {
         drawBootScreen();
     }
+}
+
+static void setUnavailableMapBootStatus() {
+    if (config.mapProvider == MapProvider::None) {
+        setBootStage(BOOT_MAP, BootStatus::Skip);
+    } else if (config.stadiaApiKey.isEmpty()) {
+        setBootStage(BOOT_MAP, BootStatus::NoKey);
+    } else {
+        setBootStage(BOOT_MAP, BootStatus::Skip);
+    }
+}
+
+static bool preloadMapCache() {
+    if (config.mapProvider == MapProvider::None) {
+        setBootStage(BOOT_MAP, BootStatus::Skip);
+        return true;
+    }
+    if (config.stadiaApiKey.isEmpty()) {
+        setBootStage(BOOT_MAP, BootStatus::NoKey);
+        return true;
+    }
+    if (!mapRuntimeReady || WiFi.status() != WL_CONNECTED) {
+        setBootStage(BOOT_MAP, BootStatus::Fail);
+        return false;
+    }
+
+    bool allLoaded = true;
+    for (size_t i = 0; i < RANGE_COUNT; i++) {
+        char progress[12];
+        snprintf(progress, sizeof(progress), "%u/%u",
+                 static_cast<unsigned>(i + 1),
+                 static_cast<unsigned>(RANGE_COUNT));
+        setBootStage(BOOT_MAP, BootStatus::Running, progress);
+        bool loaded = RadarMap::background.fetchStadia(
+            config.lat,
+            config.lon,
+            ranges[i].outerKm,
+            RADAR_RADIUS,
+            config.stadiaApiKey,
+            i
+        );
+        allLoaded = loaded && allLoaded;
+    }
+    setBootStage(BOOT_MAP, allLoaded ? BootStatus::Ok : BootStatus::Fail);
+    return allLoaded;
 }
 
 static void drawBootSetupHint(const char *text, uint16_t color) {
@@ -439,6 +514,11 @@ static void loadConfig() {
     config.lon = prefs.getDouble("lon", DEFAULT_LON);
     config.miles = prefs.getBool("miles", false);
     config.showRunways = prefs.getBool("runways", true);
+    uint8_t storedMapProvider = prefs.getUChar("map", DEFAULT_MAP_PROVIDER);
+    config.mapProvider = storedMapProvider == static_cast<uint8_t>(MapProvider::Stadia)
+        ? MapProvider::Stadia
+        : MapProvider::None;
+    config.stadiaApiKey = prefs.getString("stadiaKey", DEFAULT_STADIA_API_KEY);
     config.configured = prefs.getBool("configured", config.ssid.length() > 0);
     rangeIndex = std::min<size_t>(prefs.getUChar("range", 1), RANGE_COUNT - 1);
 }
@@ -450,6 +530,8 @@ static void saveConfig() {
     prefs.putDouble("lon", config.lon);
     prefs.putBool("miles", config.miles);
     prefs.putBool("runways", config.showRunways);
+    prefs.putUChar("map", static_cast<uint8_t>(config.mapProvider));
+    prefs.putString("stadiaKey", config.stadiaApiKey);
     prefs.putBool("configured", config.ssid.length() > 0);
     config.configured = config.ssid.length() > 0;
 }
@@ -500,11 +582,11 @@ static void drawDisplayDiagnostics() {
 
 static void handleRoot() {
     String body;
-    body.reserve(2500);
+    body.reserve(3400);
     body += F("<!doctype html><html><head><meta charset='utf-8'>");
     body += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
     body += F("<title>Plane Radar Setup</title>");
-    body += F("<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#050805;color:#e8ffe8;margin:24px}label{display:block;margin:14px 0 6px;color:#73ff8a}input{width:100%;box-sizing:border-box;padding:10px;background:#111;border:1px solid #295;color:#fff}button{margin-top:18px;padding:12px 18px;background:#19d45a;border:0;color:#001b08;font-weight:700}small{color:#8a9}</style>");
+    body += F("<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#050805;color:#e8ffe8;margin:24px}label{display:block;margin:14px 0 6px;color:#73ff8a}input,select{width:100%;box-sizing:border-box;padding:10px;background:#111;border:1px solid #295;color:#fff}button{margin-top:18px;padding:12px 18px;background:#19d45a;border:0;color:#001b08;font-weight:700}small{color:#8a9}</style>");
     body += F("</head><body><h1>Plane Radar Setup</h1>");
     body += F("<form method='POST' action='/save'>");
     body += F("<label>Wi-Fi SSID</label><input name='ssid' value='");
@@ -525,6 +607,16 @@ static void handleRoot() {
     body += F("<label><input type='checkbox' name='runways' ");
     if (config.showRunways) body += F("checked");
     body += F("> Show airports/runways</label>");
+    body += F("<label>Map background</label><select name='map'>");
+    body += F("<option value='0'");
+    if (config.mapProvider == MapProvider::None) body += F(" selected");
+    body += F(">None</option><option value='1'");
+    if (config.mapProvider == MapProvider::Stadia) body += F(" selected");
+    body += F(">Stadia Alidade Smooth Dark</option></select>");
+    body += F("<label>Stadia Maps API key</label><input name='stadia_key' type='password' value='");
+    body += htmlEscape(config.stadiaApiKey);
+    body += F("'>");
+    body += F("<small>The radar continues without a map if this is empty or the map request fails.</small>");
     body += F("<button type='submit'>Save and reboot</button></form>");
     body += F("<p><a href='/screenshot.bmp'>Download current screen BMP</a></p>");
     body += F("<p><small>Short tap on radar: range preset. Long press: setup portal. Range is saved.</small></p>");
@@ -587,6 +679,10 @@ static void handleSave() {
     double lon = server.arg("lon").toDouble();
     bool miles = server.hasArg("miles");
     bool showRunways = server.hasArg("runways");
+    MapProvider mapProvider = server.arg("map").toInt() == 1
+        ? MapProvider::Stadia
+        : MapProvider::None;
+    String stadiaApiKey = server.arg("stadia_key");
 
     lockState();
     config.ssid = ssid;
@@ -595,6 +691,8 @@ static void handleSave() {
     config.lon = lon;
     config.miles = miles;
     config.showRunways = showRunways;
+    config.mapProvider = mapProvider;
+    config.stadiaApiKey = stadiaApiKey;
     saveConfig();
     unlockState();
     server.send(200, "text/html", "<html><body><h1>Saved</h1><p>Rebooting...</p></body></html>");
@@ -1118,13 +1216,25 @@ static bool fetchAdsb() {
     double centerLat = 0;
     double centerLon = 0;
     float outerKm = 0;
+    size_t activeRangeIndex = 0;
     lockState();
     centerLat = config.lat;
     centerLon = config.lon;
     outerKm = activeOuterKm();
+    activeRangeIndex = rangeIndex;
     unlockState();
 
-    float fetchNm = (outerKm * 1.25f) / KM_PER_NM;
+    float fetchScale = 1.25f;
+    if (RadarMap::background.isReady(activeRangeIndex)) {
+        float mapHalfWidth = static_cast<float>(
+            std::max(RADAR_CX, PANEL_X - RADAR_CX)
+        );
+        float mapHalfHeight = static_cast<float>(
+            std::max(RADAR_CY, SCREEN_H - RADAR_CY)
+        );
+        fetchScale = hypotf(mapHalfWidth, mapHalfHeight) / RADAR_RADIUS;
+    }
+    float fetchNm = (outerKm * fetchScale) / KM_PER_NM;
     String url = "https://opendata.adsb.fi/api/v3/lat/";
     url += String(centerLat, 6);
     url += "/lon/";
@@ -1263,17 +1373,46 @@ static void extrapolatedPosition(const Aircraft &item, uint32_t now, float &lat,
     lon = item.lon + eastKm / lonScale;
 }
 
-static void prepareAircraftGeometry(Aircraft *items, size_t itemCount) {
+static bool isInsideMapViewport(int x, int y) {
+    return x >= 0 && x < PANEL_X && y >= 0 && y < SCREEN_H;
+}
+
+static void projectToMapEdge(int projectedX, int projectedY, int &x, int &y) {
+    float dx = static_cast<float>(projectedX - RADAR_CX);
+    float dy = static_cast<float>(projectedY - RADAR_CY);
+    float scale = 1.0f;
+    float left = static_cast<float>(MAP_EDGE_MARKER_MARGIN);
+    float right = static_cast<float>(PANEL_X - 1 - MAP_EDGE_MARKER_MARGIN);
+    float top = static_cast<float>(MAP_EDGE_MARKER_MARGIN);
+    float bottom = static_cast<float>(SCREEN_H - 1 - MAP_EDGE_MARKER_MARGIN);
+
+    if (dx < 0.0f) scale = std::min(scale, (left - RADAR_CX) / dx);
+    if (dx > 0.0f) scale = std::min(scale, (right - RADAR_CX) / dx);
+    if (dy < 0.0f) scale = std::min(scale, (top - RADAR_CY) / dy);
+    if (dy > 0.0f) scale = std::min(scale, (bottom - RADAR_CY) / dy);
+
+    x = RADAR_CX + static_cast<int>(lroundf(dx * scale));
+    y = RADAR_CY + static_cast<int>(lroundf(dy * scale));
+}
+
+static void prepareAircraftGeometry(
+    Aircraft *items,
+    size_t itemCount,
+    bool useMapViewport
+) {
     uint32_t now = millis();
     for (size_t i = 0; i < itemCount; i++) {
         extrapolatedPosition(items[i], now, items[i].renderLat, items[i].renderLon);
-        items[i].inside = toRadarPoint(
+        bool insideRadar = toRadarPoint(
             items[i].renderLat,
             items[i].renderLon,
             items[i].screenX,
             items[i].screenY,
             items[i].distanceKm
         );
+        items[i].inside = useMapViewport
+            ? isInsideMapViewport(items[i].screenX, items[i].screenY)
+            : insideRadar;
     }
     std::sort(items, items + itemCount, [](const Aircraft &a, const Aircraft &b) {
         return a.distanceKm > b.distanceKm;
@@ -1468,6 +1607,7 @@ static void drawRadar() {
 
     size_t renderCount = 0;
     char emptyStatus[64];
+    size_t renderRangeIndex = 0;
     lockState();
     renderCount = aircraftCount;
     if (renderCount > 0) {
@@ -1475,6 +1615,7 @@ static void drawRadar() {
     }
     memcpy(renderRouteCache, routeCache, sizeof(renderRouteCache));
     strlcpy(emptyStatus, statusText.c_str(), sizeof(emptyStatus));
+    renderRangeIndex = rangeIndex;
     unlockState();
 
     bool logDraw = drawCounter <= 3 || drawCounter % 120 == 0;
@@ -1490,8 +1631,11 @@ static void drawRadar() {
     }
     auto &g = screen;
     g.startWrite();
-    g.fillScreen(colorBg);
-    prepareAircraftGeometry(renderAircraft, renderCount);
+    bool mapVisible = RadarMap::background.draw(g, renderRangeIndex);
+    if (!mapVisible) {
+        g.fillScreen(colorBg);
+    }
+    prepareAircraftGeometry(renderAircraft, renderCount, mapVisible);
     int cx = RADAR_CX;
     int cy = RADAR_CY;
     int radius = RADAR_RADIUS;
@@ -1523,14 +1667,18 @@ static void drawRadar() {
         int x = renderAircraft[i].screenX;
         int y = renderAircraft[i].screenY;
         if (!renderAircraft[i].inside) {
-            float dxKm = 0;
-            float dyKm = 0;
-            float distKm = 0;
-            offsetKm(renderAircraft[i].renderLat, renderAircraft[i].renderLon, dxKm, dyKm, distKm);
-            if (distKm < 0.01f) continue;
-            float ang = atan2f(dxKm, dyKm);
-            x = cx + lroundf(sinf(ang) * (radius + 12));
-            y = cy - lroundf(cosf(ang) * (radius + 12));
+            if (mapVisible) {
+                projectToMapEdge(x, y, x, y);
+            } else {
+                float dxKm = 0;
+                float dyKm = 0;
+                float distKm = 0;
+                offsetKm(renderAircraft[i].renderLat, renderAircraft[i].renderLon, dxKm, dyKm, distKm);
+                if (distKm < 0.01f) continue;
+                float ang = atan2f(dxKm, dyKm);
+                x = cx + lroundf(sinf(ang) * (radius + 12));
+                y = cy - lroundf(cosf(ang) * (radius + 12));
+            }
             g.fillSmoothCircle(x, y, 4, colorPlane);
             continue;
         }
@@ -1727,19 +1875,25 @@ void setup() {
     logStep("loadConfig begin");
     setBootStage(BOOT_CONFIG, BootStatus::Running);
     loadConfig();
+    mapRuntimeReady = config.mapProvider == MapProvider::Stadia &&
+                      !config.stadiaApiKey.isEmpty() &&
+                      RadarMap::background.begin(PANEL_X, SCREEN_H, RANGE_COUNT);
     setBootStage(BOOT_CONFIG, BootStatus::Ok);
-    Serial.printf("[config] configured=%d ssid_len=%u lat=%.6f lon=%.6f range=%u runways=%d miles=%d\n",
+    Serial.printf("[config] configured=%d ssid_len=%u lat=%.6f lon=%.6f range=%u runways=%d miles=%d map=%u map_key_len=%u\n",
                   config.configured,
                   static_cast<unsigned>(config.ssid.length()),
                   config.lat,
                   config.lon,
                   static_cast<unsigned>(rangeIndex),
                   config.showRunways,
-                  config.miles);
+                  config.miles,
+                  static_cast<unsigned>(config.mapProvider),
+                  static_cast<unsigned>(config.stadiaApiKey.length()));
     Serial.flush();
 
     if (!config.configured) {
         setBootStage(BOOT_WIFI, BootStatus::Skip);
+        setUnavailableMapBootStatus();
         setBootStage(BOOT_SERVICES, BootStatus::Running);
         logStep("startPortal begin");
         startPortal();
@@ -1751,6 +1905,7 @@ void setup() {
         logStep("connectWifi begin");
         if (!connectWifiOnce(WIFI_CONNECT_ATTEMPT_MS)) {
             setBootStage(BOOT_WIFI, BootStatus::Fail);
+            setUnavailableMapBootStatus();
             setStatus("WIFI RETRY");
             setBootStage(BOOT_SERVICES, BootStatus::Running);
             logStep("connect failed, startPortal begin");
@@ -1761,6 +1916,7 @@ void setup() {
         } else {
             setBootStage(BOOT_WIFI, BootStatus::Ok);
             setBootStage(BOOT_SERVICES, BootStatus::Ok);
+            preloadMapCache();
             setBootStage(BOOT_DATA, BootStatus::Running);
             bool dataOk = fetchAdsb();
             lastFetchMs = millis();

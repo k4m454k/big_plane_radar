@@ -24,6 +24,17 @@ DEFAULT_WIFI_SSID="${DEFAULT_WIFI_SSID:-}"
 DEFAULT_WIFI_PASSWORD="${DEFAULT_WIFI_PASSWORD:-}"
 DEFAULT_LAT="${DEFAULT_LAT:-51.507400}"
 DEFAULT_LON="${DEFAULT_LON:--0.127800}"
+DEFAULT_MAP_PROVIDER="${DEFAULT_MAP_PROVIDER:-none}"
+DEFAULT_STADIA_API_KEY="${DEFAULT_STADIA_API_KEY:-}"
+
+case "$DEFAULT_MAP_PROVIDER" in
+  none|0) DEFAULT_MAP_PROVIDER_CODE=0 ;;
+  stadia|1) DEFAULT_MAP_PROVIDER_CODE=1 ;;
+  *)
+    echo "DEFAULT_MAP_PROVIDER must be 'none' or 'stadia'." >&2
+    exit 1
+    ;;
+esac
 
 FQBN="esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,DebugLevel=info,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
 
@@ -34,12 +45,14 @@ c_define_string() {
   printf '"%s"' "$value"
 }
 
-COMMON_FLAGS="-I$PROJECT_DIR -I$PROJECT_DIR/src"
+COMMON_FLAGS="-I$PROJECT_DIR -I$PROJECT_DIR/src -DPNG_MAX_BUFFERED_PIXELS=8322"
 CPP_FLAGS="$COMMON_FLAGS"
 CPP_FLAGS+=" -DDEFAULT_WIFI_SSID=$(c_define_string "$DEFAULT_WIFI_SSID")"
 CPP_FLAGS+=" -DDEFAULT_WIFI_PASSWORD=$(c_define_string "$DEFAULT_WIFI_PASSWORD")"
 CPP_FLAGS+=" -DDEFAULT_LAT=$DEFAULT_LAT"
 CPP_FLAGS+=" -DDEFAULT_LON=$DEFAULT_LON"
+CPP_FLAGS+=" -DDEFAULT_MAP_PROVIDER=$DEFAULT_MAP_PROVIDER_CODE"
+CPP_FLAGS+=" -DDEFAULT_STADIA_API_KEY=$(c_define_string "$DEFAULT_STADIA_API_KEY")"
 
 mkdir -p "$BUILD_PATH"
 
