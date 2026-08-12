@@ -51,11 +51,23 @@ static constexpr int MEDIUM_FONT_ADVANCE = 10;
 static constexpr uint8_t MEDIUM_COLUMN_WIDTHS[FONT_W] = {2, 1, 2, 1, 2};
 static constexpr uint8_t MEDIUM_ROW_HEIGHTS[FONT_H] = {2, 1, 2, 1, 2, 1, 2};
 
+// Probe bus pins. The Waveshare boards expose the CH422G expander and GT911 on
+// GPIO 8/9; on the CrowPanel those two pins are RGB data lines (G3 and G0), and
+// its GT911 lives on GPIO 19/20 instead. The two pin sets are mutually
+// destructive, which is why the CrowPanel cannot be autodetected.
+#if PLANE_RADAR_BOARD_CROWPANEL7
+static constexpr int PROBE_I2C_SDA = 19;
+static constexpr int PROBE_I2C_SCL = 20;
+#else
+static constexpr int PROBE_I2C_SDA = 8;
+static constexpr int PROBE_I2C_SCL = 9;
+#endif
+
 static bool beginProbeI2c() {
     i2c_config_t config = {};
     config.mode = I2C_MODE_MASTER;
-    config.sda_io_num = static_cast<gpio_num_t>(8);
-    config.scl_io_num = static_cast<gpio_num_t>(9);
+    config.sda_io_num = static_cast<gpio_num_t>(PROBE_I2C_SDA);
+    config.scl_io_num = static_cast<gpio_num_t>(PROBE_I2C_SCL);
     config.sda_pullup_en = GPIO_PULLUP_ENABLE;
     config.scl_pullup_en = GPIO_PULLUP_ENABLE;
     config.master.clk_speed = 400000;
@@ -154,7 +166,189 @@ static bool prepare7BHardware() {
     return true;
 }
 
+#if PLANE_RADAR_BOARD_CROWPANEL7
+// CrowPanel V3.0 adds a PCA9557 that gates the GT911 reset line; V2.0 wires the
+// panel directly and has no expander. Probing lets one image serve both, so the
+// board revision never has to be known at build time.
+// PCA9557 registers: 0x00 input, 0x01 output, 0x02 polarity, 0x03 direction
+// (bit set = input).
+// IO0 is the GT911 reset line and IO1 is its interrupt line. INT must be held
+// LOW across the reset rising edge -- that level is what the GT911 latches to
+// choose its I2C address (low -> 0x5D, high -> 0x14) -- and must then be handed
+// back as an input so the controller can actually signal contacts. Sequence
+// taken from Elecrow's own V3.0 demo.
+static constexpr uint8_t PCA9557_TOUCH_RESET = 1U << 0;
+static constexpr uint8_t PCA9557_TOUCH_INT = 1U << 1;
+static uint8_t crowPanelExpanderAddress = 0;
+// The GT911 answers on 0x5D or 0x14 depending on the INT pin level latched at
+// reset. INT is not broken out here, so the level is whatever the board leaves
+// it at; the probe records which address replied and the bus is pinned to it
+// rather than trusting the driver's compiled-in default.
+static uint8_t crowPanelTouchAddress = 0;
+
+static bool writePca9557(uint8_t reg, uint8_t value) {
+    uint8_t data[2] = {reg, value};
+    return i2c_master_write_to_device(
+        I2C_NUM_0,
+        crowPanelExpanderAddress,
+        data,
+        sizeof(data),
+        pdMS_TO_TICKS(100)
+    ) == ESP_OK;
+}
+
+// Returns true when a V3.0 expander was found and the touch reset pulse was
+// issued. A false return is the normal, healthy V2.0 path, not an error.
+static bool prepareCrowPanelExpander() {
+    crowPanelExpanderAddress = 0;
+    for (uint8_t candidate : {0x19, 0x18}) {
+        uint8_t scratch = 0;
+        if (readI2cRegister8(candidate, 0x00, scratch)) {
+            crowPanelExpanderAddress = candidate;
+            break;
+        }
+    }
+    if (crowPanelExpanderAddress == 0) {
+        return false;
+    }
+
+    // Drive both RST and INT as outputs, and hold both low.
+    const uint8_t driven = static_cast<uint8_t>(PCA9557_TOUCH_RESET | PCA9557_TOUCH_INT);
+    if (!writePca9557(0x03, static_cast<uint8_t>(~driven))) return false;
+    if (!writePca9557(0x01, 0x00)) return false;
+    delay(20);
+
+    // Release reset while INT is still low, latching address 0x5D.
+    if (!writePca9557(0x01, PCA9557_TOUCH_RESET)) return false;
+    delay(100);
+
+    // Hand INT back to the controller (config bit set = input).
+    if (!writePca9557(0x03, static_cast<uint8_t>(~PCA9557_TOUCH_RESET))) return false;
+    delay(50);
+    return true;
+}
+
+static BoardConfig makeCrowPanelBoardConfig() {
+    BoardConfig config = ESP_PANEL_BOARD_DEFAULT_CONFIG;
+    config.name = "Elecrow:CrowPanel-7.0-DIS08070H";
+    config.stage_callbacks.fill(nullptr);
+    // No CH422G on this board; the compile-time default would otherwise try to
+    // drive an expander bus over two of the RGB data lines.
+    config.io_expander.reset();
+
+    auto *rgb = std::get_if<BusRGB::Config>(&config.lcd->bus_config);
+    auto *refresh = rgb == nullptr
+        ? nullptr
+        : std::get_if<BusRGB::RefreshPanelPartialConfig>(&rgb->refresh_panel);
+    if (refresh != nullptr) {
+        refresh->pclk_hz = PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ;
+        refresh->h_res = 800;
+        refresh->v_res = 480;
+        // Elecrow reference timing for the LI0704122Z panel.
+        refresh->hsync_pulse_width = 48;
+        refresh->hsync_back_porch = 40;
+        refresh->hsync_front_porch = 40;
+        refresh->vsync_pulse_width = 31;
+        refresh->vsync_back_porch = 13;
+        refresh->vsync_front_porch = 1;
+        refresh->bounce_buffer_size_px = 800 * PLANE_RADAR_RGB_BOUNCE_LINES;
+        refresh->flags_pclk_active_neg = true;
+        refresh->hsync_gpio_num = 39;
+        refresh->vsync_gpio_num = 40;
+        refresh->de_gpio_num = 41;
+        refresh->pclk_gpio_num = 0;
+        refresh->disp_gpio_num = -1;
+        // Data lines are ordered B0-B4, G0-G5, R0-R4 for RGB565.
+        const int dataPins[16] = {
+            15, 7, 6, 5, 4,          // B0-B4
+            9, 46, 3, 8, 16, 1,      // G0-G5
+            14, 21, 47, 48, 45,      // R0-R4
+        };
+        std::copy(std::begin(dataPins), std::end(dataPins), std::begin(refresh->data_gpio_nums));
+    }
+
+    auto *lcdVendor = std::get_if<LCD::VendorPartialConfig>(
+        &config.lcd->device_config.vendor
+    );
+    if (lcdVendor != nullptr) {
+        lcdVendor->hor_res = 800;
+        lcdVendor->ver_res = 480;
+    }
+
+    auto *touchBus = std::get_if<BusI2C::Config>(&config.touch->bus_config);
+    if (touchBus != nullptr) {
+        if (touchBus->host.has_value()) {
+            auto *touchHost = std::get_if<BusI2C::HostPartialConfig>(&touchBus->host.value());
+            if (touchHost != nullptr) {
+                touchHost->sda_io_num = PROBE_I2C_SDA;
+                touchHost->scl_io_num = PROBE_I2C_SCL;
+            }
+        }
+        if (crowPanelTouchAddress != 0) {
+            touchBus->control_panel.dev_addr = crowPanelTouchAddress;
+        }
+    }
+
+    auto *touchDevice = std::get_if<Touch::DevicePartialConfig>(
+        &config.touch->device_config.device
+    );
+    if (touchDevice != nullptr) {
+        touchDevice->x_max = 800;
+        touchDevice->y_max = 480;
+        // Reset is either hard-wired (V2.0) or already pulsed via the PCA9557
+        // above, and no interrupt line is broken out.
+        touchDevice->rst_gpio_num = -1;
+        touchDevice->int_gpio_num = -1;
+    }
+
+    // Backlight is a plain GPIO here, so LEDC gives real brightness control
+    // rather than the expander on/off switch the Waveshare boards use.
+    config.backlight = BoardConfig::BacklightConfig{
+        .config = BacklightPWM_LEDC::Config{
+            .ledc_channel = BacklightPWM_LEDC::LEDC_ChannelPartialConfig{
+                .io_num = 2,
+                .on_level = 1,
+            },
+        },
+        .pre_process = {.idle_off = 0},
+    };
+    return config;
+}
+#endif // PLANE_RADAR_BOARD_CROWPANEL7
+
 static Model detectAndPrepareModel() {
+#if PLANE_RADAR_BOARD_CROWPANEL7
+    uint16_t crowTouchWidth = 0;
+    uint16_t crowTouchHeight = 0;
+    bool crowProbeOk = false;
+    bool crowExpander = false;
+
+    if (beginProbeI2c()) {
+        crowExpander = prepareCrowPanelExpander();
+        for (uint8_t attempt = 0; attempt < 3 && !crowProbeOk; attempt++) {
+            for (uint8_t address : {0x5D, 0x14}) {
+                if (readGt911Dimensions(address, crowTouchWidth, crowTouchHeight)) {
+                    crowProbeOk = true;
+                    crowPanelTouchAddress = address;
+                    break;
+                }
+            }
+            if (!crowProbeOk) delay(30);
+        }
+        i2c_driver_delete(I2C_NUM_0);
+    }
+
+    RADAR_LOGI(
+        "[display] probe gt911=%d addr=0x%02X limits=%ux%u pca9557=%d rev=%s selected=CrowPanel-7.0\n",
+        crowProbeOk ? 1 : 0,
+        static_cast<unsigned>(crowPanelTouchAddress),
+        static_cast<unsigned>(crowTouchWidth),
+        static_cast<unsigned>(crowTouchHeight),
+        crowExpander ? 1 : 0,
+        crowExpander ? "V3.0" : "V2.0"
+    );
+    return Model::CrowPanel7;
+#else
     Model detected = Model::TouchLcd7;
     uint16_t touchWidth = 0;
     uint16_t touchHeight = 0;
@@ -197,6 +391,7 @@ static Model detectAndPrepareModel() {
         i2c_driver_delete(I2C_NUM_0);
     }
     return detected;
+#endif // PLANE_RADAR_BOARD_CROWPANEL7
 }
 
 static BoardConfig make7BBoardConfig() {
@@ -312,12 +507,17 @@ static const uint8_t *glyphFor(char c) {
 bool Canvas::begin() {
     RADAR_LOGD("[display] ESP32_Display_Panel backend begin\n");
     _model = detectAndPrepareModel();
+#if PLANE_RADAR_BOARD_CROWPANEL7
+    BoardConfig config = makeCrowPanelBoardConfig();
+    board = new Board(config);
+#else
     if (_model == Model::TouchLcd7B) {
         BoardConfig config = make7BBoardConfig();
         board = new Board(config);
     } else {
         board = new Board();
     }
+#endif
     if (board == nullptr) {
         RADAR_LOGE("[display] Board allocation failed\n");
         return false;
@@ -467,6 +667,9 @@ bool Canvas::readTouch(uint16_t *x, uint16_t *y) {
     if (count <= 0) {
         return false;
     }
+    _lastRawTouchX = points[0].x;
+    _lastRawTouchY = points[0].y;
+    _touchReadCount++;
     if (x != nullptr) *x = static_cast<uint16_t>(std::max(0, std::min(_width - 1, points[0].x)));
     if (y != nullptr) *y = static_cast<uint16_t>(std::max(0, std::min(_height - 1, points[0].y)));
     return true;
@@ -480,15 +683,19 @@ const uint16_t *Canvas::displayedFrameBuffer() const {
 }
 
 const char *Canvas::modelName() const {
-    return _model == Model::TouchLcd7B
-        ? "ESP32-S3-Touch-LCD-7B"
-        : "ESP32-S3-Touch-LCD-7";
+    switch (_model) {
+    case Model::TouchLcd7B: return "ESP32-S3-Touch-LCD-7B";
+    case Model::CrowPanel7: return "CrowPanel-7.0-DIS08070H";
+    default:                return "ESP32-S3-Touch-LCD-7";
+    }
 }
 
 uint32_t Canvas::pixelClockHz() const {
-    return _model == Model::TouchLcd7B
-        ? PLANE_RADAR_RGB_7B_PCLK_HZ
-        : PLANE_RADAR_RGB_PCLK_HZ;
+    switch (_model) {
+    case Model::TouchLcd7B: return PLANE_RADAR_RGB_7B_PCLK_HZ;
+    case Model::CrowPanel7: return PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ;
+    default:                return PLANE_RADAR_RGB_PCLK_HZ;
+    }
 }
 
 uint16_t Canvas::color565(uint8_t r, uint8_t g, uint8_t b) const {

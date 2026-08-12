@@ -80,7 +80,36 @@ case "$DEFAULT_MAP_PROVIDER" in
     ;;
 esac
 
-FQBN="esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,DebugLevel=$CORE_DEBUG_LEVEL,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
+DISPLAY_PROFILE="${DISPLAY_PROFILE:-0}"
+
+# The Waveshare boards ship 16 MB of flash; the CrowPanel has 4 MB, so it needs
+# its own layout. The firmware has no OTA path, which frees profile 9 to use
+# huge_app and hand the whole 3 MB slot to the application.
+PROFILE_FLAGS=""
+case "$DISPLAY_PROFILE" in
+  0|7|8)
+    FLASH_OPTS="FlashMode=qio,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB"
+    UPLOAD_SPEED=921600
+    ;;
+  9)
+    # QIO boot-loops on this board: the ROM loader gets one segment in and then
+    # trips the watchdog before the IDF bootloader ever runs. DIO boots cleanly.
+    FLASH_OPTS="FlashMode=dio,FlashSize=4M,PartitionScheme=huge_app"
+    # The CrowPanel talks through a CH340 bridge, which is far less tolerant of
+    # high upload rates than the Waveshare CH343.
+    UPLOAD_SPEED="${UPLOAD_SPEED:-460800}"
+    # The board config header only compiles in the backlight driver it names, and
+    # it names the CH422G expander switch. The CrowPanel drives its backlight
+    # from a bare GPIO, so the LEDC driver has to be switched on explicitly.
+    PROFILE_FLAGS=" -DESP_PANEL_DRIVERS_BACKLIGHT_USE_PWM_LEDC=1"
+    ;;
+  *)
+    echo "DISPLAY_PROFILE must be 0 (auto), 7, 8, or 9 (CrowPanel 7.0)." >&2
+    exit 1
+    ;;
+esac
+
+FQBN="esp32:esp32:esp32s3:UploadSpeed=$UPLOAD_SPEED,USBMode=hwcdc,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,$FLASH_OPTS,DebugLevel=$CORE_DEBUG_LEVEL,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
 
 c_define_string() {
   local value="$1"
@@ -93,6 +122,7 @@ COMMON_FLAGS="-I$PROJECT_DIR -I$PROJECT_DIR/src -DPNG_MAX_BUFFERED_PIXELS=8322"
 CPP_FLAGS="$COMMON_FLAGS"
 CPP_FLAGS+=" -DPLANE_RADAR_LOG_LEVEL=$APP_LOG_LEVEL"
 CPP_FLAGS+=" -DPLANE_RADAR_RGB_BOUNCE_LINES=$RGB_BOUNCE_LINES"
+CPP_FLAGS+=" -DPLANE_RADAR_DISPLAY_PROFILE=$DISPLAY_PROFILE$PROFILE_FLAGS"
 CPP_FLAGS+=" -DPLANE_RADAR_REQUIRE_HIGH_PERF=$REQUIRE_HIGH_PERF"
 CPP_FLAGS+=" -DDEFAULT_WIFI_SSID=$(c_define_string "$DEFAULT_WIFI_SSID")"
 CPP_FLAGS+=" -DDEFAULT_WIFI_PASSWORD=$(c_define_string "$DEFAULT_WIFI_PASSWORD")"
