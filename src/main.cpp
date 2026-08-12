@@ -249,6 +249,61 @@ static RadarLabelRender radarLabels[MAX_AIRCRAFT];
 static char selectedAircraftHex[7] = {};
 static char visibleListAircraftHex[PANEL_MAX_ROWS][7] = {};
 static size_t visibleListRowCount = 0;
+// The panel shows PANEL_MAX_ROWS at most while MAX_AIRCRAFT are tracked, so
+// without an offset everything past the first screenful was unreachable.
+static int listScrollOffset = 0;
+static size_t listTotalRowCount = 0;
+static int touchScrollAccumPx = 0;
+static bool touchScrolled = false;
+
+// On-device settings screen. Covers every setting that can be changed by
+// tapping; free-text fields (Wi-Fi password, Stadia key) stay on the web portal,
+// which remains reachable from a row inside this screen.
+static constexpr int SETTINGS_TOP = 58;
+static constexpr int SETTINGS_ROW_H = 52;
+static bool settingsActive = false;
+static int settingsScrollOffset = 0;
+static bool settingsRedraw = false;
+static bool settingsRestartNeeded = false;
+
+// Opt-in UI debugging: adds /ui/* HTTP routes that drive the on-device UI and
+// report touch state, so screens can be captured and input diagnosed remotely.
+// Off by default -- the routes let anyone on the network operate the display.
+// Enable with -DPLANE_RADAR_DEBUG_UI=1.
+#ifndef PLANE_RADAR_DEBUG_UI
+#define PLANE_RADAR_DEBUG_UI 0
+#endif
+
+#if PLANE_RADAR_DEBUG_UI
+#define DBG_UI(stmt) do { stmt; } while (0)
+static uint16_t dbgTouchX = 0;
+static uint16_t dbgTouchY = 0;
+static uint32_t dbgTapEvents = 0;
+static uint32_t dbgListTapCalls = 0;
+static int32_t dbgLastRow = -1;
+static int32_t dbgLastReject = 0;   // 0 ok, 1 left of panel, 2 above list, 3 row out of range
+#else
+#define DBG_UI(stmt) do { } while (0)
+#endif
+
+enum class SettingRowId : uint8_t {
+    Units,
+    Runways,
+    Symbols,
+    LabelCallsign,
+    LabelType,
+    LabelAltitude,
+    LabelVerticalRate,
+    AirportMode,
+    AirportCount,
+    AirportRadius,
+    MapProvider,
+    MapBrightness,
+    Range,
+    WebPortal,
+    Save,
+    Count
+};
 static size_t aircraftCount = 0;
 static String statusText = "BOOT";
 static String lastFetchText = "NO DATA";
@@ -1654,6 +1709,70 @@ static void startWebServer() {
     server.on("/screenshot", HTTP_GET, handleScreenshot);
     server.on("/screenshot.bmp", HTTP_GET, handleScreenshot);
     server.on("/save", HTTP_POST, handleSave);
+
+#if PLANE_RADAR_DEBUG_UI
+    // Debug affordances: drive the on-device UI over the network so any screen
+    // can be captured with /screenshot.bmp without physically touching the
+    // panel. Invaluable for verifying UI work on a device you cannot see.
+    server.on("/ui/settings", HTTP_GET, []() {
+        settingsActive = true;
+        settingsScrollOffset = server.hasArg("scroll")
+            ? server.arg("scroll").toInt()
+            : 0;
+        settingsRedraw = true;
+        server.send(200, "text/plain", "settings");
+    });
+    server.on("/ui/radar", HTTP_GET, []() {
+        settingsActive = false;
+        lockState();
+        networkDataDirty = true;
+        unlockState();
+        server.send(200, "text/plain", "radar");
+    });
+    server.on("/ui/select", HTTP_GET, []() {
+        lockState();
+        // No hex given: pick whatever is at the top of the visible list, so the
+        // card can be exercised without knowing an ICAO address up front.
+        String wanted = server.arg("hex");
+        strlcpy(
+            selectedAircraftHex,
+            wanted.length() > 0 ? wanted.c_str() : visibleListAircraftHex[0],
+            sizeof(selectedAircraftHex)
+        );
+        networkDataDirty = true;
+        unlockState();
+        server.send(200, "text/plain", selectedAircraftHex);
+    });
+
+    server.on("/ui/touch", HTTP_GET, []() {
+        char body[420];
+        snprintf(
+            body,
+            sizeof(body),
+            "reads=%lu raw=%d,%d clamped=%d,%d\n"
+            "panel_w=%dx%d PANEL_X=%d LIST_TOP=%d ROW_H=%d\n"
+            "taps=%lu listTapCalls=%lu lastRow=%ld reject=%ld\n"
+            "visibleRows=%u panelVisibleRows=%u totalRows=%u scroll=%d\n"
+            "selected=%s settingsActive=%d\n",
+            static_cast<unsigned long>(screen.touchReadCount()),
+            screen.lastRawTouchX(), screen.lastRawTouchY(),
+            static_cast<int>(dbgTouchX), static_cast<int>(dbgTouchY),
+            screen.width(), screen.height(), PANEL_X, PANEL_LIST_TOP, PANEL_ROW_H,
+            static_cast<unsigned long>(dbgTapEvents),
+            static_cast<unsigned long>(dbgListTapCalls),
+            static_cast<long>(dbgLastRow),
+            static_cast<long>(dbgLastReject),
+            static_cast<unsigned>(visibleListRowCount),
+            static_cast<unsigned>(panelVisibleRows),
+            static_cast<unsigned>(listTotalRowCount),
+            listScrollOffset,
+            selectedAircraftHex[0] ? selectedAircraftHex : "(none)",
+            settingsActive ? 1 : 0
+        );
+        server.send(200, "text/plain", body);
+    });
+#endif // PLANE_RADAR_DEBUG_UI
+
     server.onNotFound(handleNotFound);
     server.begin();
     webServerStarted = true;
@@ -3202,7 +3321,15 @@ static void drawAircraftList(
     int textWidth = PANEL_RIGHT - PANEL_TEXT_X;
     int maxRows = static_cast<int>(panelVisibleRows);
     int drawn = 0;
-    for (int idx = static_cast<int>(itemCount) - 1; idx >= 0 && drawn < maxRows; idx--) {
+
+    // Rows are drawn from the end of the sorted array backwards, so the scroll
+    // offset counts entries skipped at that end.
+    listTotalRowCount = itemCount;
+    int maxScroll = std::max(0, static_cast<int>(itemCount) - maxRows);
+    listScrollOffset = std::min(std::max(listScrollOffset, 0), maxScroll);
+
+    for (int idx = static_cast<int>(itemCount) - 1 - listScrollOffset;
+         idx >= 0 && drawn < maxRows; idx--) {
         const Aircraft &item = items[idx];
         int rowY = PANEL_LIST_TOP + drawn * PANEL_ROW_H;
         int iconX = PANEL_X + 20;
@@ -3268,11 +3395,136 @@ static void drawAircraftList(
         drawn++;
     }
 
+    // Scrollbar, drawn only when there is more than one screenful. Without it
+    // there is nothing on screen to suggest the list can move at all.
+    if (itemCount > static_cast<size_t>(maxRows)) {
+        int trackTop = PANEL_LIST_TOP - 2;
+        int trackH = maxRows * PANEL_ROW_H;
+        int barX = SCREEN_W - 7;
+        g.fillRect(barX, trackTop, 5, trackH, colorGrid);
+        int thumbH = std::max(24, trackH * maxRows / static_cast<int>(itemCount));
+        int span = trackH - thumbH;
+        int thumbY = trackTop +
+            (maxScroll > 0 ? span * listScrollOffset / maxScroll : 0);
+        g.fillRect(barX, thumbY, 5, thumbH, colorText);
+    }
+
     if (drawn == 0) {
         g.setTextDatum(textdatum_t::top_left);
         g.setTextSize(1);
         g.setTextColor(colorDim, colorBg);
         g.drawString(WiFi.status() == WL_CONNECTED ? "NO AIRCRAFT" : emptyStatus, PANEL_TEXT_X, PANEL_LIST_TOP);
+    }
+}
+
+// Expanded read-out for the tapped aircraft. Drawn over the radar rather than
+// inside the list so it costs no rows and composes with scrolling; the top-left
+// corner is the least useful part of the radar area, being outside the sweep
+// circle. Everything here is already carried on Aircraft but never surfaced.
+template <typename Gfx>
+static void drawSelectedAircraftCard(
+    Gfx &g,
+    const Aircraft *items,
+    size_t itemCount,
+    const RouteCacheEntry *routes,
+    size_t routeCount,
+    const char *selectedHex
+) {
+    if (selectedHex == nullptr || selectedHex[0] == '\0') return;
+
+    const Aircraft *sel = nullptr;
+    for (size_t i = 0; i < itemCount; i++) {
+        if (strcmp(items[i].hex, selectedHex) == 0) {
+            sel = &items[i];
+            break;
+        }
+    }
+    if (sel == nullptr) return;
+
+    constexpr int CARD_X = 8;
+    constexpr int CARD_Y = 8;
+    constexpr int CARD_W = 236;
+    constexpr int CARD_H = 152;
+
+    g.fillRect(CARD_X, CARD_Y, CARD_W, CARD_H, colorBg);
+    g.drawWideLine(CARD_X, CARD_Y, CARD_X + CARD_W, CARD_Y, 1.0f, colorGrid);
+    g.drawWideLine(CARD_X, CARD_Y + CARD_H, CARD_X + CARD_W, CARD_Y + CARD_H, 1.0f, colorGrid);
+    g.drawWideLine(CARD_X + CARD_W, CARD_Y, CARD_X + CARD_W, CARD_Y + CARD_H, 1.0f, colorGrid);
+    // Same warm marker the selected list row uses, so the two read as one selection.
+    g.fillRect(CARD_X, CARD_Y, 3, CARD_H, colorWarn);
+
+    int tx = CARD_X + 12;
+    int ty = CARD_Y + 8;
+    int maxTextW = CARD_W - 24;
+    char line[80];
+
+    g.setTextDatum(textdatum_t::top_left);
+    g.setTextSize(2);
+    g.setTextColor(colorText, colorBg);
+    g.drawString(sel->callsign[0] ? sel->callsign : "????", tx, ty);
+    ty += 24;
+
+    g.setTextSize(1);
+    g.setTextColor(colorDim, colorBg);
+    snprintf(
+        line,
+        sizeof(line),
+        "%s  %s",
+        sel->type[0] ? sel->type : "----",
+        sel->hex[0] ? sel->hex : "------"
+    );
+    g.drawString(line, tx, ty);
+    ty += 16;
+
+    g.setTextColor(colorText, colorBg);
+    snprintf(
+        line,
+        sizeof(line),
+        "%s  %s",
+        sel->alt[0] ? sel->alt : "ALT --",
+        sel->vsi
+    );
+    g.drawString(line, tx, ty);
+    ty += 14;
+
+    char distance[16];
+    char speed[16];
+    formatDistanceLabel(sel->distanceKm, distance, sizeof(distance));
+    formatSpeedLabel(sel->gsKnots, speed, sizeof(speed));
+    snprintf(
+        line,
+        sizeof(line),
+        "%s  HDG %03d",
+        speed,
+        static_cast<int>(sel->trackDeg + 0.5f) % 360
+    );
+    g.drawString(line, tx, ty);
+    ty += 14;
+
+    snprintf(line, sizeof(line), "DIST %s", distance);
+    g.drawString(line, tx, ty);
+    ty += 14;
+
+    if (sel->squawk[0]) {
+        const char *alert = squawkAlertLabel(sel->squawk);
+        snprintf(
+            line,
+            sizeof(line),
+            "SQUAWK %s%s%s",
+            sel->squawk,
+            alert != nullptr ? " " : "",
+            alert != nullptr ? alert : ""
+        );
+        g.setTextColor(alert != nullptr ? colorWarn : colorDim, colorBg);
+        g.drawString(line, tx, ty);
+    }
+    ty += 14;
+
+    char route[(ROUTE_CITY_MAX_LEN * 2) + 8];
+    if (routeLabelForCallsign(
+            g, routes, routeCount, sel->callsign, maxTextW, route, sizeof(route))) {
+        g.setTextColor(colorRunway, colorBg);
+        g.drawString(route, tx, ty);
     }
 }
 
@@ -3515,6 +3767,15 @@ static void drawRadar() {
         renderSelectedHex
     );
 
+    drawSelectedAircraftCard(
+        g,
+        renderAircraft,
+        renderCount,
+        renderRouteCache,
+        MAX_ROUTE_CACHE,
+        renderSelectedHex
+    );
+
     g.endWrite();
     presentScreenOrRestart();
     uint32_t completedAt = millis();
@@ -3529,17 +3790,23 @@ static void drawRadar() {
 }
 
 static bool handleAircraftListTap(uint16_t x, uint16_t y) {
+    DBG_UI(dbgListTapCalls++; dbgLastRow = -1);
     if (x < PANEL_X) {
+        DBG_UI(dbgLastReject = 1);
         return false;
     }
     if (y < PANEL_LIST_TOP) {
+        DBG_UI(dbgLastReject = 2);
         return true;
     }
 
     size_t row = static_cast<size_t>((y - PANEL_LIST_TOP) / PANEL_ROW_H);
+    DBG_UI(dbgLastRow = static_cast<int32_t>(row));
     if (row >= visibleListRowCount || row >= panelVisibleRows) {
+        DBG_UI(dbgLastReject = 3);
         return true;
     }
+    DBG_UI(dbgLastReject = 0);
 
     char tappedHex[7] = {};
     strlcpy(tappedHex, visibleListAircraftHex[row], sizeof(tappedHex));
@@ -3553,7 +3820,11 @@ static bool handleAircraftListTap(uint16_t x, uint16_t y) {
     if (strcmp(selectedAircraftHex, tappedHex) == 0) {
         selectedAircraftHex[0] = '\0';
         changed = true;
-    } else if (findAircraftTrackLocked(tappedHex) != nullptr) {
+    } else {
+        // Selection no longer requires existing track history. It used to, which
+        // made a tap on a newly appeared aircraft do nothing at all with no
+        // feedback; now the detail card shows immediately and the trail fills in
+        // once enough positions have accumulated.
         strlcpy(
             selectedAircraftHex,
             tappedHex,
@@ -3578,6 +3849,332 @@ static bool handleAircraftListTap(uint16_t x, uint16_t y) {
     return true;
 }
 
+static const char *settingRowLabel(SettingRowId id) {
+    switch (id) {
+    case SettingRowId::Units:             return "DISTANCE UNITS";
+    case SettingRowId::Runways:           return "SHOW RUNWAYS";
+    case SettingRowId::Symbols:           return "AIRCRAFT SYMBOLS";
+    case SettingRowId::LabelCallsign:     return "LABEL: CALLSIGN";
+    case SettingRowId::LabelType:         return "LABEL: TYPE";
+    case SettingRowId::LabelAltitude:     return "LABEL: ALTITUDE";
+    case SettingRowId::LabelVerticalRate: return "LABEL: VERTICAL RATE";
+    case SettingRowId::AirportMode:       return "AIRPORT SELECTION";
+    case SettingRowId::AirportCount:      return "AIRPORT COUNT";
+    case SettingRowId::AirportRadius:     return "AIRPORT RADIUS";
+    case SettingRowId::MapProvider:       return "MAP PROVIDER";
+    case SettingRowId::MapBrightness:     return "MAP BRIGHTNESS";
+    case SettingRowId::Range:             return "RADAR RANGE";
+    case SettingRowId::WebPortal:         return "WEB PORTAL";
+    // The bitmap font has no '&' or '%' glyph; both fall through to '?'.
+    case SettingRowId::Save:              return settingsRestartNeeded
+                                                 ? "SAVE / RESTART"
+                                                 : "SAVE / CLOSE";
+    default:                              return "";
+    }
+}
+
+// Steppers get -/+ hit zones; everything else toggles or cycles on a row tap.
+static bool settingRowIsStepper(SettingRowId id) {
+    return id == SettingRowId::AirportCount ||
+           id == SettingRowId::AirportRadius ||
+           id == SettingRowId::MapBrightness ||
+           id == SettingRowId::Range;
+}
+
+static bool settingRowIsAction(SettingRowId id) {
+    return id == SettingRowId::WebPortal || id == SettingRowId::Save;
+}
+
+static void settingRowValue(SettingRowId id, char *out, size_t outLen) {
+    out[0] = '\0';
+    switch (id) {
+    case SettingRowId::Units:
+        strlcpy(out, config.miles ? "MILES" : "KM", outLen);
+        break;
+    case SettingRowId::Runways:
+        strlcpy(out, config.showRunways ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::Symbols:
+        strlcpy(
+            out,
+            config.aircraftSymbolStyle == AircraftSymbolStyle::Classic
+                ? "CLASSIC"
+                : "DETAILED",
+            outLen
+        );
+        break;
+    case SettingRowId::LabelCallsign:
+        strlcpy(out, config.showLabelCallsign ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::LabelType:
+        strlcpy(out, config.showLabelType ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::LabelAltitude:
+        strlcpy(out, config.showLabelAltitude ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::LabelVerticalRate:
+        strlcpy(out, config.showLabelVerticalRate ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::AirportMode:
+        strlcpy(
+            out,
+            config.airportSelectionMode == AirportSelectionMode::Manual
+                ? "MANUAL"
+                : "AUTOMATIC",
+            outLen
+        );
+        break;
+    case SettingRowId::AirportCount:
+        snprintf(out, outLen, "%u", static_cast<unsigned>(config.airportCount));
+        break;
+    case SettingRowId::AirportRadius:
+        snprintf(out, outLen, "%u KM", static_cast<unsigned>(config.airportRadiusKm));
+        break;
+    case SettingRowId::MapProvider:
+        strlcpy(
+            out,
+            config.mapProvider == MapProvider::Stadia ? "STADIA" : "NONE",
+            outLen
+        );
+        break;
+    case SettingRowId::MapBrightness:
+        snprintf(out, outLen, "%u PCT", static_cast<unsigned>(config.mapBrightness));
+        break;
+    case SettingRowId::Range:
+        strlcpy(out, rangeLabel(), outLen);
+        break;
+    case SettingRowId::WebPortal:
+        strlcpy(out, portalActive ? "RUNNING" : "START", outLen);
+        break;
+    default:
+        break;
+    }
+}
+
+// delta is -1/+1 for stepper rows and 0 for toggles, cycles and actions.
+static void settingRowActivate(SettingRowId id, int delta) {
+    bool airportsChanged = false;
+    lockState();
+    switch (id) {
+    case SettingRowId::Units:
+        config.miles = !config.miles;
+        break;
+    case SettingRowId::Runways:
+        config.showRunways = !config.showRunways;
+        break;
+    case SettingRowId::Symbols:
+        config.aircraftSymbolStyle =
+            config.aircraftSymbolStyle == AircraftSymbolStyle::Classic
+                ? AircraftSymbolStyle::DetailedIcons
+                : AircraftSymbolStyle::Classic;
+        break;
+    case SettingRowId::LabelCallsign:
+        config.showLabelCallsign = !config.showLabelCallsign;
+        break;
+    case SettingRowId::LabelType:
+        config.showLabelType = !config.showLabelType;
+        break;
+    case SettingRowId::LabelAltitude:
+        config.showLabelAltitude = !config.showLabelAltitude;
+        break;
+    case SettingRowId::LabelVerticalRate:
+        config.showLabelVerticalRate = !config.showLabelVerticalRate;
+        break;
+    case SettingRowId::AirportMode:
+        config.airportSelectionMode =
+            config.airportSelectionMode == AirportSelectionMode::Manual
+                ? AirportSelectionMode::Automatic
+                : AirportSelectionMode::Manual;
+        airportsChanged = true;
+        break;
+    case SettingRowId::AirportCount:
+        config.airportCount = static_cast<uint8_t>(std::min(
+            static_cast<int>(AIRPORT_COUNT_MAX),
+            std::max(1, static_cast<int>(config.airportCount) + delta)
+        ));
+        airportsChanged = true;
+        break;
+    case SettingRowId::AirportRadius:
+        config.airportRadiusKm = static_cast<uint16_t>(std::min(
+            static_cast<int>(AIRPORT_RADIUS_MAX_KM),
+            std::max(
+                static_cast<int>(AIRPORT_RADIUS_MIN_KM),
+                static_cast<int>(config.airportRadiusKm) + delta * 10
+            )
+        ));
+        airportsChanged = true;
+        break;
+    case SettingRowId::MapProvider:
+        config.mapProvider = config.mapProvider == MapProvider::Stadia
+            ? MapProvider::None
+            : MapProvider::Stadia;
+        // Map views are rendered into PSRAM at boot, so this cannot take effect
+        // until the next start.
+        settingsRestartNeeded = true;
+        break;
+    case SettingRowId::MapBrightness:
+        config.mapBrightness = static_cast<uint8_t>(std::min(
+            100,
+            std::max(
+                static_cast<int>(MAP_BRIGHTNESS_MIN),
+                static_cast<int>(config.mapBrightness) + delta * 5
+            )
+        ));
+        settingsRestartNeeded = true;
+        break;
+    case SettingRowId::Range:
+        rangeIndex = static_cast<size_t>(
+            (static_cast<int>(rangeIndex) + delta + static_cast<int>(RANGE_COUNT)) %
+            static_cast<int>(RANGE_COUNT)
+        );
+        forceAdsbFetch = true;
+        break;
+    default:
+        break;
+    }
+    networkDataDirty = true;
+    unlockState();
+
+    if (airportsChanged) {
+        selectConfiguredAirports();
+    }
+    if (id == SettingRowId::Range) {
+        saveRange();
+    }
+}
+
+static void drawSettingsScreen() {
+    auto &g = screen;
+    int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 10) / SETTINGS_ROW_H);
+    int total = static_cast<int>(SettingRowId::Count);
+    int maxScroll = std::max(0, total - maxRows);
+    settingsScrollOffset = std::min(std::max(settingsScrollOffset, 0), maxScroll);
+
+    int minusX = SCREEN_W - 236;
+    int plusX = SCREEN_W - 142;
+    int btnW = 68;
+    int btnH = 36;
+
+    g.startWrite();
+    g.fillScreen(colorBg);
+
+    g.setTextDatum(textdatum_t::top_left);
+    g.setTextSize(2);
+    g.setTextColor(colorText, colorBg);
+    g.drawString("SETTINGS", 24, 14);
+    g.setTextSize(1);
+    g.setTextColor(colorDim, colorBg);
+    g.drawString("DRAG TO SCROLL / TAP TO CHANGE", 190, 24);
+    g.drawWideLine(16, 48, SCREEN_W - 16, 48, 1.0f, colorGrid);
+
+    for (int slot = 0; slot < maxRows; slot++) {
+        int index = slot + settingsScrollOffset;
+        if (index >= total) break;
+        SettingRowId id = static_cast<SettingRowId>(index);
+        int rowY = SETTINGS_TOP + slot * SETTINGS_ROW_H;
+        bool action = settingRowIsAction(id);
+
+        if (action) {
+            g.fillRect(16, rowY, SCREEN_W - 32, SETTINGS_ROW_H - 6, colorSelectedRow);
+            g.fillRect(16, rowY, 3, SETTINGS_ROW_H - 6, colorWarn);
+        }
+
+        g.setTextDatum(textdatum_t::top_left);
+        g.setTextSize(1);
+        g.setTextColor(action ? colorWarn : colorText, action ? colorSelectedRow : colorBg);
+        g.drawMediumString(settingRowLabel(id), 30, rowY + 14);
+
+        char value[24];
+        settingRowValue(id, value, sizeof(value));
+        if (value[0] != '\0') {
+            g.setTextDatum(textdatum_t::top_right);
+            g.setTextColor(colorDim, action ? colorSelectedRow : colorBg);
+            g.drawMediumString(
+                value,
+                settingRowIsStepper(id) ? minusX - 16 : SCREEN_W - 30,
+                rowY + 14
+            );
+        }
+
+        if (settingRowIsStepper(id)) {
+            int btnY = rowY + 4;
+            g.fillRect(minusX, btnY, btnW, btnH, colorSelectedRow);
+            g.fillRect(plusX, btnY, btnW, btnH, colorSelectedRow);
+            g.setTextDatum(textdatum_t::top_left);
+            g.setTextColor(colorText, colorSelectedRow);
+            g.drawMediumString("-", minusX + btnW / 2 - 4, btnY + 12);
+            g.drawMediumString("+", plusX + btnW / 2 - 4, btnY + 12);
+        }
+
+        g.drawWideLine(
+            24,
+            rowY + SETTINGS_ROW_H - 5,
+            SCREEN_W - 24,
+            rowY + SETTINGS_ROW_H - 5,
+            1.0f,
+            colorGrid
+        );
+    }
+
+    if (total > maxRows) {
+        int trackTop = SETTINGS_TOP;
+        int trackH = maxRows * SETTINGS_ROW_H;
+        int barX = SCREEN_W - 10;
+        g.fillRect(barX, trackTop, 5, trackH, colorGrid);
+        int thumbH = std::max(24, trackH * maxRows / total);
+        int thumbY = trackTop +
+            (maxScroll > 0 ? (trackH - thumbH) * settingsScrollOffset / maxScroll : 0);
+        g.fillRect(barX, thumbY, 5, thumbH, colorText);
+    }
+
+    g.endWrite();
+    presentScreenOrRestart();
+}
+
+static void handleSettingsTap(uint16_t x, uint16_t y) {
+    int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 10) / SETTINGS_ROW_H);
+    if (y < SETTINGS_TOP) return;
+    int slot = (static_cast<int>(y) - SETTINGS_TOP) / SETTINGS_ROW_H;
+    if (slot < 0 || slot >= maxRows) return;
+    int index = slot + settingsScrollOffset;
+    if (index >= static_cast<int>(SettingRowId::Count)) return;
+
+    SettingRowId id = static_cast<SettingRowId>(index);
+    settingsRedraw = true;
+
+    if (id == SettingRowId::WebPortal) {
+        startPortal();
+        return;
+    }
+    if (id == SettingRowId::Save) {
+        lockState();
+        saveConfig();
+        networkDataDirty = true;
+        unlockState();
+        settingsActive = false;
+        if (settingsRestartNeeded) {
+            drawStatusScreen("SAVED", "Restarting to apply map changes...");
+            delay(800);
+            ESP.restart();
+        }
+        return;
+    }
+
+    if (settingRowIsStepper(id)) {
+        int minusX = SCREEN_W - 236;
+        int plusX = SCREEN_W - 142;
+        int btnW = 68;
+        if (x >= minusX && x < minusX + btnW) {
+            settingRowActivate(id, -1);
+        } else if (x >= plusX && x < plusX + btnW) {
+            settingRowActivate(id, 1);
+        }
+        return;
+    }
+
+    settingRowActivate(id, 0);
+}
+
 static void handleTouch() {
     uint16_t x = 0;
     uint16_t y = 0;
@@ -3585,6 +4182,7 @@ static void handleTouch() {
     bool rawDown = screen.readTouch(&x, &y);
     if (rawDown) {
         touchLastContactMs = now;
+        DBG_UI(dbgTouchX = x; dbgTouchY = y);
     }
     bool down = rawDown ||
         (touchWasDown && now - touchLastContactMs < TOUCH_RELEASE_DEBOUNCE_MS);
@@ -3595,27 +4193,108 @@ static void handleTouch() {
         touchLastX = x;
         touchLastY = y;
         longPressHandled = false;
+        touchScrollAccumPx = 0;
+        touchScrolled = false;
     }
+
+    if (settingsActive) {
+        if (rawDown) {
+            touchScrollAccumPx += static_cast<int>(y) - static_cast<int>(touchLastY);
+            int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 10) / SETTINGS_ROW_H);
+            int maxScroll =
+                std::max(0, static_cast<int>(SettingRowId::Count) - maxRows);
+            bool moved = false;
+            while (touchScrollAccumPx >= SETTINGS_ROW_H && settingsScrollOffset > 0) {
+                settingsScrollOffset--;
+                touchScrollAccumPx -= SETTINGS_ROW_H;
+                moved = true;
+            }
+            while (touchScrollAccumPx <= -SETTINGS_ROW_H &&
+                   settingsScrollOffset < maxScroll) {
+                settingsScrollOffset++;
+                touchScrollAccumPx += SETTINGS_ROW_H;
+                moved = true;
+            }
+            touchScrollAccumPx = std::min(
+                std::max(touchScrollAccumPx, -SETTINGS_ROW_H),
+                SETTINGS_ROW_H
+            );
+            if (moved) {
+                touchScrolled = true;
+                settingsRedraw = true;
+            }
+            touchLastX = x;
+            touchLastY = y;
+        }
+        if (!down && touchWasDown) {
+            int movedX = abs(static_cast<int>(touchLastX) - touchDownX);
+            int movedY = abs(static_cast<int>(touchLastY) - touchDownY);
+            if (!touchScrolled &&
+                movedX <= TOUCH_TAP_MOVE_MAX_PX &&
+                movedY <= TOUCH_TAP_MOVE_MAX_PX) {
+                handleSettingsTap(touchDownX, touchDownY);
+            }
+        }
+        touchWasDown = down;
+        return;
+    }
+
     if (rawDown) {
+        // A drag that starts inside the panel scrolls the list. Pixels are
+        // accumulated and spent a whole row at a time so rows never land
+        // half-drawn, and the remainder is clamped so dragging past either end
+        // does not build up travel that has to be undone.
+        if (touchDownX >= PANEL_X && listTotalRowCount > panelVisibleRows) {
+            touchScrollAccumPx += static_cast<int>(y) - static_cast<int>(touchLastY);
+            int maxScroll = static_cast<int>(listTotalRowCount) -
+                static_cast<int>(panelVisibleRows);
+            bool moved = false;
+            while (touchScrollAccumPx >= PANEL_ROW_H && listScrollOffset > 0) {
+                listScrollOffset--;
+                touchScrollAccumPx -= PANEL_ROW_H;
+                moved = true;
+            }
+            while (touchScrollAccumPx <= -PANEL_ROW_H && listScrollOffset < maxScroll) {
+                listScrollOffset++;
+                touchScrollAccumPx += PANEL_ROW_H;
+                moved = true;
+            }
+            touchScrollAccumPx =
+                std::min(std::max(touchScrollAccumPx, -PANEL_ROW_H), PANEL_ROW_H);
+            if (moved) {
+                touchScrolled = true;
+                lockState();
+                networkDataDirty = true;
+                unlockState();
+            }
+        }
         touchLastX = x;
         touchLastY = y;
     }
-    if (down && !longPressHandled && now - touchDownMs >= TOUCH_LONG_PRESS_MS) {
+    if (down && !longPressHandled && !touchScrolled &&
+        now - touchDownMs >= TOUCH_LONG_PRESS_MS) {
         longPressHandled = true;
-        startPortal();
+        // Long press now opens the on-device settings rather than jumping
+        // straight to the web portal; the portal is a row inside it.
+        settingsActive = true;
+        settingsScrollOffset = 0;
+        settingsRestartNeeded = false;
+        settingsRedraw = true;
     }
     if (down && !longPressHandled && !configNoticeShown && now - touchDownMs >= CONFIG_HOLD_NOTICE_MS) {
         configNoticeShown = true;
-        setStatus("HOLD FOR SETUP");
+        setStatus("HOLD FOR SETTINGS");
     }
     if (!down && touchWasDown) {
         uint32_t held = now - touchDownMs;
         int movedX = abs(static_cast<int>(touchLastX) - touchDownX);
         int movedY = abs(static_cast<int>(touchLastY) - touchDownY);
         bool tap = !longPressHandled &&
+            !touchScrolled &&
             held < TOUCH_LONG_PRESS_MS &&
             movedX <= TOUCH_TAP_MOVE_MAX_PX &&
             movedY <= TOUCH_TAP_MOVE_MAX_PX;
+        if (tap) DBG_UI(dbgTapEvents++);
         if (tap && !handleAircraftListTap(touchDownX, touchDownY)) {
             lockState();
             rangeIndex = (rangeIndex + 1) % RANGE_COUNT;
@@ -4019,7 +4698,13 @@ void loop() {
     handleTouch();
 
     uint32_t now = millis();
-    if (shouldDrawRadarFrame(now)) {
+    if (settingsActive) {
+        // Redraw only on change; the settings screen is static between taps.
+        if (settingsRedraw) {
+            settingsRedraw = false;
+            drawSettingsScreen();
+        }
+    } else if (shouldDrawRadarFrame(now)) {
         drawRadar();
     }
     delay(1);
