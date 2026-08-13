@@ -1,5 +1,6 @@
 .DS_Store
 build/
+logs/
 .cache/
 *.pyc
 __pycache__/
@@ -9,3 +10,7 @@ docs/future_ideas/
 # Keep release binaries explicit.
 !releases/
 !releases/**
+
+# Host preview tool build output
+tools/preview/preview
+tools/preview/*.png

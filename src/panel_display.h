@@ -2,6 +2,9 @@
 
 #include <Arduino.h>
 
+// Glyph constants and the bitmap font live here so tools/preview can share them.
+#include "panel_font.h"
+
 static constexpr uint16_t TFT_BLACK = 0x0000;
 static constexpr uint16_t TFT_BLUE = 0x001F;
 static constexpr uint16_t TFT_GREEN = 0x07E0;
@@ -22,8 +25,6 @@ enum class Model : uint8_t {
     CrowPanel7,
 };
 
-static constexpr char GLYPH_COPYRIGHT = '\x1e';
-static constexpr char GLYPH_ARROW_DOWN = '\x1f';
 
 class Canvas {
 public:
