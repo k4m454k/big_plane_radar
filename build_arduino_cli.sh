@@ -33,9 +33,9 @@ RGB_BOUNCE_LINES="${RGB_BOUNCE_LINES:-10}"
 REQUIRE_HIGH_PERF="${REQUIRE_HIGH_PERF:-0}"
 
 case "$RGB_BOUNCE_LINES" in
-  10|20) ;;
+  10|20|30) ;;
   *)
-    echo "RGB_BOUNCE_LINES must be 10 or 20." >&2
+    echo "RGB_BOUNCE_LINES must be 10, 20, or 30." >&2
     exit 1
     ;;
 esac

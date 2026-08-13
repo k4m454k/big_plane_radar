@@ -72,11 +72,17 @@
 // cost is two buffers of (width * lines * 2) bytes -- at 800 px wide, 32 KB per
 // step of 10.
 //
-// 30 lines is NOT viable on the CrowPanel and was tried: it leaves ~134 KB of
-// internal heap, and the TLS handshake for the ADS-B fetch then fails with
-// "SSL - Memory allocation failed" on every poll, emptying the aircraft list.
-// Boot looks entirely healthy, because the allocation that fails happens later.
-// 20 is the ceiling here; reach for a lower pixel clock instead.
-#if PLANE_RADAR_RGB_BOUNCE_LINES != 10 && PLANE_RADAR_RGB_BOUNCE_LINES != 20
-#error "PLANE_RADAR_RGB_BOUNCE_LINES must be 10 or 20"
+// 30 was previously impossible: it leaves ~134 KB of internal heap, and the TLS
+// handshake for the ADS-B fetch then failed with "SSL - Memory allocation
+// failed" on every poll, emptying the aircraft list -- while boot looked
+// entirely healthy, because the allocation that fails happens later under load.
+//
+// With ADS-B, routes and map tiles all served over plain HTTP by pi-feed there
+// is no TLS context to allocate, which frees roughly the same amount again. 30
+// is therefore viable when a local feed is configured. Verify the aircraft list
+// still populates after changing this, not just that the device boots.
+#if PLANE_RADAR_RGB_BOUNCE_LINES != 10 && \
+    PLANE_RADAR_RGB_BOUNCE_LINES != 20 && \
+    PLANE_RADAR_RGB_BOUNCE_LINES != 30
+#error "PLANE_RADAR_RGB_BOUNCE_LINES must be 10, 20, or 30"
 #endif
