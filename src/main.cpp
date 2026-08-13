@@ -158,6 +158,12 @@ struct AppConfig {
         : MapProvider::None;
     String stadiaApiKey = DEFAULT_STADIA_API_KEY;
     uint8_t mapBrightness = MAP_BRIGHTNESS_DEFAULT;
+    // Optional local ADS-B feed, e.g. a Pi running readsb behind pi-feed. Host
+    // and port only ("192.168.1.20:8080"); the path mirrors the public API so
+    // only the scheme and host differ. Kept separate from the enable flag so
+    // the source can be toggled on-device without retyping the address.
+    String feedHost;
+    bool useLocalFeed = false;
     bool configured = false;
 };
 
@@ -321,6 +327,7 @@ enum class SettingRowId : uint8_t {
     MapProvider,
     MapBrightness,
     Range,
+    FeedSource,
     WebPortal,
     Save,
     Count
@@ -1373,6 +1380,8 @@ static void loadConfig() {
         ? MapProvider::Stadia
         : MapProvider::None;
     config.stadiaApiKey = prefs.getString("stadiaKey", DEFAULT_STADIA_API_KEY);
+    config.feedHost = prefs.getString("feedHost", "");
+    config.useLocalFeed = prefs.getBool("feedLocal", false) && config.feedHost.length() > 0;
     config.mapBrightness = static_cast<uint8_t>(std::max(
         static_cast<int>(MAP_BRIGHTNESS_MIN),
         std::min(100, static_cast<int>(prefs.getUChar("mapBright", MAP_BRIGHTNESS_DEFAULT)))
@@ -1399,6 +1408,8 @@ static void saveConfig() {
     prefs.putUChar("symbols", static_cast<uint8_t>(config.aircraftSymbolStyle));
     prefs.putUChar("map", static_cast<uint8_t>(config.mapProvider));
     prefs.putString("stadiaKey", config.stadiaApiKey);
+    prefs.putString("feedHost", config.feedHost);
+    prefs.putBool("feedLocal", config.useLocalFeed && config.feedHost.length() > 0);
     prefs.putUChar("mapBright", config.mapBrightness);
     prefs.putBool("configured", config.ssid.length() > 0);
     config.configured = config.ssid.length() > 0;
@@ -1585,7 +1596,12 @@ static void handleRoot() {
     body += F("%</output></div><label class='field'>Stadia Maps API key</label><input name='stadia_key' type='password' value='");
     body += htmlEscape(config.stadiaApiKey);
     body += F("'>");
-    body += F("<small>The radar continues without a map if this is empty or the map request fails.</small></section>");
+    body += F("<small>The radar continues without a map if this is empty or the map request fails.</small>");
+    body += F("<label class='field'>Local ADS-B feed host</label><input name='feed_host' value='");
+    body += htmlEscape(config.feedHost);
+    body += F("'>");
+    body += F("<small>Host:port of a pi-feed instance, e.g. 192.168.1.20:8080. Leave empty to use the public API. Switch between them from the on-device settings screen.</small></section>");
+    body += F("<input type='hidden' name='form' value='full'>");
     body += F("<button class='save' type='submit'>Save and reboot</button></form>");
     body += F("<p><a href='/screenshot.bmp'>Download current screen BMP</a></p>");
     body += F("<p><small>Tap radar: range preset. Tap an aircraft row: toggle its track. Long press: setup portal. Range is saved.</small></p>");
@@ -1657,13 +1673,27 @@ static void handleScreenshot() {
 }
 
 static void handleSave() {
-    String ssid = server.arg("ssid");
-    String password = server.arg("pass");
-    double lat = server.arg("lat").toDouble();
-    double lon = server.arg("lon").toDouble();
-    bool miles = server.hasArg("miles");
-    bool showRunways = server.hasArg("runways");
-    AirportSelectionMode airportSelectionMode = server.arg("airport_mode").toInt() ==
+    // A request that omits a field must leave it alone rather than blanking it.
+    // Checkboxes cannot express "absent" versus "unticked", so the real form
+    // carries a hidden marker; only a submission bearing it is allowed to clear
+    // them. Without this, any partial POST silently wipes the whole config --
+    // including Wi-Fi credentials -- and reboots into the setup portal.
+    const bool fullForm = server.hasArg("form");
+    auto text = [](const char *name, const String &current) {
+        return server.hasArg(name) ? server.arg(name) : current;
+    };
+    auto flag = [fullForm](const char *name, bool current) {
+        return fullForm ? server.hasArg(name) : current;
+    };
+
+    String ssid = text("ssid", config.ssid);
+    String password = text("pass", config.password);
+    double lat = server.hasArg("lat") ? server.arg("lat").toDouble() : config.lat;
+    double lon = server.hasArg("lon") ? server.arg("lon").toDouble() : config.lon;
+    bool miles = flag("miles", config.miles);
+    bool showRunways = flag("runways", config.showRunways);
+    AirportSelectionMode airportSelectionMode = text("airport_mode",
+            String(static_cast<int>(config.airportSelectionMode))).toInt() ==
             static_cast<int>(AirportSelectionMode::Manual)
         ? AirportSelectionMode::Manual
         : AirportSelectionMode::Automatic;
@@ -1681,19 +1711,24 @@ static void handleSave() {
         AIRPORT_RADIUS_MIN_KM,
         std::min<long>(AIRPORT_RADIUS_MAX_KM, requestedAirportRadius)
     ));
-    String manualAirportIcao = normalizeAirportIcao(server.arg("airport_icao"));
-    bool showLabelCallsign = server.hasArg("label_callsign");
-    bool showLabelType = server.hasArg("label_type");
-    bool showLabelAltitude = server.hasArg("label_altitude");
-    bool showLabelVerticalRate = server.hasArg("label_vrate");
-    AircraftSymbolStyle aircraftSymbolStyle = server.arg("symbol_style").toInt() ==
+    String manualAirportIcao = normalizeAirportIcao(
+        text("airport_icao", config.manualAirportIcao));
+    bool showLabelCallsign = flag("label_callsign", config.showLabelCallsign);
+    bool showLabelType = flag("label_type", config.showLabelType);
+    bool showLabelAltitude = flag("label_altitude", config.showLabelAltitude);
+    bool showLabelVerticalRate = flag("label_vrate", config.showLabelVerticalRate);
+    AircraftSymbolStyle aircraftSymbolStyle = text("symbol_style",
+            String(static_cast<int>(config.aircraftSymbolStyle))).toInt() ==
             static_cast<int>(AircraftSymbolStyle::Classic)
         ? AircraftSymbolStyle::Classic
         : AircraftSymbolStyle::DetailedIcons;
-    MapProvider mapProvider = server.arg("map").toInt() == 1
+    MapProvider mapProvider = text("map",
+            String(static_cast<int>(config.mapProvider))).toInt() == 1
         ? MapProvider::Stadia
         : MapProvider::None;
-    String stadiaApiKey = server.arg("stadia_key");
+    String stadiaApiKey = text("stadia_key", config.stadiaApiKey);
+    String feedHost = text("feed_host", config.feedHost);
+    feedHost.trim();
     int requestedMapBrightness = server.hasArg("map_brightness")
         ? server.arg("map_brightness").toInt()
         : config.mapBrightness;
@@ -1721,6 +1756,10 @@ static void handleSave() {
     config.mapProvider = mapProvider;
     config.stadiaApiKey = stadiaApiKey;
     config.mapBrightness = mapBrightness;
+    config.feedHost = feedHost;
+    if (feedHost.length() == 0) {
+        config.useLocalFeed = false;
+    }
     saveConfig();
     unlockState();
     server.send(200, "text/html", "<html><body><h1>Saved</h1><p>Rebooting...</p></body></html>");
@@ -2670,7 +2709,25 @@ static bool fetchAdsb() {
         fetchScale = hypotf(mapHalfWidth, mapHalfHeight) / RADAR_RADIUS;
     }
     float fetchNm = (outerKm * fetchScale) / KM_PER_NM;
-    String url = "https://opendata.adsb.fi/api/v3/lat/";
+
+    String feedHost;
+    bool useLocalFeed = false;
+    lockState();
+    feedHost = config.feedHost;
+    useLocalFeed = config.useLocalFeed && feedHost.length() > 0;
+    unlockState();
+
+    // pi-feed mirrors the public API's path, so only scheme and host change.
+    // Plain HTTP on the LAN also skips the TLS handshake, which is by far the
+    // largest transient allocation this firmware makes.
+    String url;
+    if (useLocalFeed) {
+        url = "http://";
+        url += feedHost;
+        url += "/api/v3/lat/";
+    } else {
+        url = "https://opendata.adsb.fi/api/v3/lat/";
+    }
     url += String(centerLat, 6);
     url += "/lon/";
     url += String(centerLon, 6);
@@ -2696,13 +2753,25 @@ static bool fetchAdsb() {
         fetchNm,
         rangeLabel()
     );
-    strlcpy(responseLine, "HTTPS REQUEST / CONNECTING", sizeof(responseLine));
+    strlcpy(
+        responseLine,
+        useLocalFeed ? "HTTP REQUEST / CONNECTING" : "HTTPS REQUEST / CONNECTING",
+        sizeof(responseLine)
+    );
     setBootStageDetails(BOOT_DATA, endpointLine, centerLine, radiusLine, responseLine);
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    // Only build the TLS client when the request actually needs it; the
+    // handshake is by far the largest transient allocation this firmware makes.
+    std::unique_ptr<WiFiClient> client;
+    if (useLocalFeed) {
+        client.reset(new WiFiClient());
+    } else {
+        auto *secure = new WiFiClientSecure();
+        secure->setInsecure();
+        client.reset(secure);
+    }
     HTTPClient http;
-    if (!http.begin(client, url)) {
+    if (client == nullptr || !http.begin(*client, url)) {
         strlcpy(responseLine, "HTTP BEGIN FAILED", sizeof(responseLine));
         setBootStageDetails(BOOT_DATA, endpointLine, centerLine, radiusLine, responseLine);
         setLastFetchText("HTTP BEGIN FAIL");
@@ -3996,6 +4065,7 @@ static const char *settingRowLabel(SettingRowId id) {
     case SettingRowId::MapProvider:       return "MAP PROVIDER";
     case SettingRowId::MapBrightness:     return "MAP BRIGHTNESS";
     case SettingRowId::Range:             return "RADAR RANGE";
+    case SettingRowId::FeedSource:        return "ADS-B SOURCE";
     case SettingRowId::WebPortal:         return "WEB PORTAL";
     // The bitmap font has no '&' or '%' glyph; both fall through to '?'.
     case SettingRowId::Save:              return settingsRestartNeeded
@@ -4075,6 +4145,13 @@ static void settingRowValue(SettingRowId id, char *out, size_t outLen) {
     case SettingRowId::Range:
         strlcpy(out, rangeLabel(), outLen);
         break;
+    case SettingRowId::FeedSource:
+        if (config.feedHost.length() == 0) {
+            strlcpy(out, "PUBLIC / NO HOST SET", outLen);
+        } else {
+            strlcpy(out, config.useLocalFeed ? "LOCAL" : "PUBLIC", outLen);
+        }
+        break;
     case SettingRowId::WebPortal:
         strlcpy(out, portalActive ? "RUNNING" : "START", outLen);
         break;
@@ -4153,6 +4230,14 @@ static void settingRowActivate(SettingRowId id, int delta) {
             )
         ));
         settingsRestartNeeded = true;
+        break;
+    case SettingRowId::FeedSource:
+        // Only meaningful once a host has been entered via the web portal;
+        // there is no on-device text entry to set one.
+        if (config.feedHost.length() > 0) {
+            config.useLocalFeed = !config.useLocalFeed;
+            forceAdsbFetch = true;
+        }
         break;
     case SettingRowId::Range:
         rangeIndex = static_cast<size_t>(

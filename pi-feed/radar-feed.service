@@ -1,0 +1,33 @@
+[Unit]
+Description=Big Plane Radar local ADS-B feed adapter
+Documentation=https://github.com/k4m454k/big_plane_radar
+# readsb is the data source; start after Docker has had a chance to bring it up.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Point at whatever serves aircraft.json. With docker-adsb-ultrafeeder mapped to
+# host port 8080 this is the tar1090 path; a native readsb install typically
+# writes /run/readsb/aircraft.json, which can be read directly instead.
+Environment=RADAR_FEED_SOURCE=http://127.0.0.1:8080/data/aircraft.json
+Environment=RADAR_FEED_PORT=8081
+# Must not exceed MAX_AIRCRAFT in the firmware.
+Environment=RADAR_FEED_LIMIT=64
+ExecStart=/usr/bin/python3 /opt/pi-feed/radar_feed.py
+Restart=always
+RestartSec=5
+
+# No credentials, no writes, no need for anything beyond a socket.
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
