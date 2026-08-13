@@ -219,7 +219,7 @@ static void drawFontCoverage(HostCanvas &g) {
     }
     g.setTextSize(1);
     g.setTextColor(colorWarn, colorBg);
-    g.drawString("KNOWN GAPS: PERCENT AND AMPERSAND RENDER AS QUESTION MARK", 20, y + 50);
+    g.drawString("ALL PRINTABLE ASCII COVERED - THE ONLY QUESTION MARK IS THE REAL ONE", 20, y + 50);
 }
 
 int main(int argc, char **argv) {

@@ -4110,10 +4110,9 @@ static const char *settingRowLabel(SettingRowId id) {
     case SettingRowId::Range:             return "RADAR RANGE";
     case SettingRowId::FeedSource:        return "ADS-B SOURCE";
     case SettingRowId::WebPortal:         return "WEB PORTAL";
-    // The bitmap font has no '&' or '%' glyph; both fall through to '?'.
     case SettingRowId::Save:              return settingsRestartNeeded
-                                                 ? "SAVE / RESTART"
-                                                 : "SAVE / CLOSE";
+                                                 ? "SAVE & RESTART"
+                                                 : "SAVE & CLOSE";
     default:                              return "";
     }
 }
@@ -4183,7 +4182,7 @@ static void settingRowValue(SettingRowId id, char *out, size_t outLen) {
         );
         break;
     case SettingRowId::MapBrightness:
-        snprintf(out, outLen, "%u PCT", static_cast<unsigned>(config.mapBrightness));
+        snprintf(out, outLen, "%u%%", static_cast<unsigned>(config.mapBrightness));
         break;
     case SettingRowId::Range:
         strlcpy(out, rangeLabel(), outLen);
