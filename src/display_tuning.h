@@ -16,18 +16,22 @@
 //                                                         18 MHz = 36.9 Hz
 //                                                         21 MHz = 43.1 Hz
 //
-// Measured on hardware: 13 MHz (26.7 Hz) and 16 MHz (32.8 Hz) both flicker
-// badly on this TN panel; 18 MHz (36.9 Hz) cured the flicker but showed
-// artefacts, because at that rate the panel streams 36 MB/s out of PSRAM and
-// contends with XIP instruction fetch.
+// The LI0704122Z datasheet rates DCLK at min 20 MHz, typ 33.3 MHz, max 50 MHz,
+// with a typical horizontal total of 928 and vertical total of 525 -- exactly
+// the porches configured for this board. 33.3 MHz therefore gives the panel's
+// designed 68 Hz refresh.
 //
-// The two symptoms pull in opposite directions -- flicker wants a HIGHER clock,
-// artefacts want a LOWER one -- so trading between them cannot win. The way out
-// is to stop competing for PSRAM: build with REQUIRE_HIGH_PERF=0 so code runs
-// from flash rather than PSRAM, which frees the bandwidth to run the panel fast
-// enough to be flicker-free. Bounce lines cannot help here; 30 starves TLS.
+// Everything below 20 MHz is out of spec, which is why 13 MHz (26.7 Hz) and
+// 16 MHz (32.8 Hz) flickered so badly: the panel was being driven under its
+// rated minimum, not merely tuned low. Elecrow's own demo runs 15 MHz and is
+// out of spec too, so it is not a safe reference for this value.
+//
+// The cost is PSRAM bandwidth: the panel streams pclk * 2 bytes/s, so 33.3 MHz
+// is ~67 MB/s. If artefacts appear, step down toward 25 MHz rather than below
+// 20. Raising PLANE_RADAR_RGB_BOUNCE_LINES is not an option -- 30 starves the
+// TLS handshake and kills the ADS-B feed.
 #ifndef PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ
-#define PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ (21 * 1000 * 1000)
+#define PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ (33300000)
 #endif
 
 // 0: auto, 7: ESP32-S3-Touch-LCD-7, 8: ESP32-S3-Touch-LCD-7B,
