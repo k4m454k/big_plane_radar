@@ -66,8 +66,11 @@ KM_PER_NM = 1.852
 # only burns I/O. Several devices polling at 5 s share one cached read.
 CACHE_TTL_S = 0.8
 
-# Drop positions older than this. Matches the firmware's extrapolation cap.
-STALE_POSITION_S = 8.0
+# Drop positions older than this. Local reception updates about once a second,
+# so anything older is an aircraft going out of range. Kept well below the
+# firmware's extrapolation cap: stale age plus the poll interval must stay
+# inside it, or the display freezes the aircraft until the next fix.
+STALE_POSITION_S = 5.0
 
 
 def urlopen(url, timeout):
@@ -118,9 +121,10 @@ class FeedCache:
             return json.load(f)
 
     def aircraft(self):
+        """Returns (aircraft, error, age_of_this_read_in_seconds)."""
         with self._lock:
             if time.time() - self._at < CACHE_TTL_S:
-                return self._aircraft, self._error
+                return self._aircraft, self._error, time.time() - self._at
             try:
                 doc = self._load()
                 # readsb/dump1090 use "aircraft"; adsb.fi uses "ac".
@@ -130,7 +134,7 @@ class FeedCache:
             except Exception as exc:  # noqa: BLE001 - report, never crash the server
                 self._error = f"{type(exc).__name__}: {exc}"
             self._at = time.time()
-            return self._aircraft, self._error
+            return self._aircraft, self._error, 0.0
 
 
 def distance_km(lat_a, lon_a, lat_b, lon_b):
@@ -139,7 +143,7 @@ def distance_km(lat_a, lon_a, lat_b, lon_b):
     return math.hypot(dlat, dlon)
 
 
-def select(aircraft, lat, lon, dist_nm, limit):
+def select(aircraft, lat, lon, dist_nm, limit, cache_age_s=0.0):
     """Nearest `limit` aircraft within `dist_nm`.
 
     Selection is the part that matters, not order: the firmware re-sorts by
@@ -170,10 +174,17 @@ def select(aircraft, lat, lon, dist_nm, limit):
     picked.sort(key=lambda item: item[0], reverse=True)
     del picked[:max(0, len(picked) - limit)]
 
-    return [
-        {k: p[k] for k in PASSTHROUGH_FIELDS if k in p}
-        for _, p in picked
-    ]
+    out = []
+    for _, p in picked:
+        item = {k: p[k] for k in PASSTHROUGH_FIELDS if k in p}
+        # seen_pos was measured when this snapshot was read, not when the client
+        # asked. Without adding the cache age the device back-dates by too
+        # little, dead reckons slightly ahead, and every poll ends in a visible
+        # correction.
+        if isinstance(item.get("seen_pos"), (int, float)):
+            item["seen_pos"] = round(item["seen_pos"] + cache_age_s, 3)
+        out.append(item)
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -201,7 +212,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.server.cache.source == "upstream":
                 aircraft, error = [], None
             else:
-                aircraft, error = self.server.cache.aircraft()
+                aircraft, error, _ = self.server.cache.aircraft()
             self._send(200, json.dumps({
                 "ok": error is None,
                 "source": self.server.cache.source,
@@ -291,11 +302,11 @@ class Handler(BaseHTTPRequestHandler):
                 # sources cannot change which aircraft the device sees.
                 ac = select(ac, lat, lon, dist, self.server.limit)
             else:
-                aircraft, error = self.server.cache.aircraft()
+                aircraft, error, cache_age = self.server.cache.aircraft()
                 if error is not None and not aircraft:
                     self._send(503, json.dumps({"ac": [], "error": error}))
                     return
-                ac = select(aircraft, lat, lon, dist, self.server.limit)
+                ac = select(aircraft, lat, lon, dist, self.server.limit, cache_age)
 
             self._send(200, json.dumps({"ac": ac}, separators=(",", ":")))
             return

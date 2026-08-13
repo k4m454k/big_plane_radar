@@ -86,12 +86,31 @@ static constexpr uint32_t WIFI_CONNECT_ATTEMPT_MS = 15000;
 static constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 12000;
 static constexpr uint32_t ADSB_FETCH_INTERVAL_MS = 5000;
 static constexpr uint32_t RADAR_DRAW_INTERVAL_MS = 0;
-// Dead reckoning runs against a 5 s update cycle, so 30 s of unchecked
-// extrapolation let a stalled feed accumulate kilometres of fiction before the
-// next fix yanked the icon back. Cap it near two missed updates instead.
-static constexpr uint32_t AIRCRAFT_EXTRAPOLATE_MAX_MS = 8000;
-// How long to blend from the last drawn position to a newly received one.
-static constexpr uint32_t AIRCRAFT_POSITION_EASE_MS = 600;
+// Bounds how much fiction dead reckoning may invent, but it must exceed the
+// worst-case age of a fix at draw time or the projected position stops
+// advancing and the aircraft visibly parks until the next poll:
+//
+//   age = position age when fetched (<= the feed's stale filter)
+//       + time since that poll        (<= the poll interval)
+//
+// With a 5 s filter and 5 s polling that is 10 s, so 8 s froze aircraft for part
+// of every cycle -- measured as a dead stop followed by a lurch at up to 20x
+// their real speed. Keep this comfortably above filter + poll interval.
+static constexpr uint32_t AIRCRAFT_EXTRAPOLATE_MAX_MS = 15000;
+// Blending a correction over a fixed window makes apparent speed depend on how
+// wrong the prediction was: measured on hardware, a fixed 600 ms produced peaks
+// of 4-11x an aircraft's real ground speed, which reads as darting. The window
+// is therefore sized so the correction is covered at a bounded multiple of the
+// aircraft's actual speed, within these limits.
+static constexpr uint32_t AIRCRAFT_POSITION_EASE_MIN_MS = 400;
+static constexpr uint32_t AIRCRAFT_POSITION_EASE_MAX_MS = 4000;
+static constexpr float AIRCRAFT_EASE_SPEED_FACTOR = 1.5f;
+// Aircraft at the edge of reception drop out of the feed and return a few
+// seconds later. Without somewhere to ease from they snap to the new position,
+// which looks identical to a rendering fault. Remember where each was last
+// drawn for this long so a brief dropout is smoothed; past it the gap is real
+// and snapping is honest, since the intervening track is genuinely unknown.
+static constexpr uint32_t AIRCRAFT_REAPPEAR_EASE_MS = 10000;
 static constexpr uint32_t ROUTE_LOOKUP_INTERVAL_MS = 5000;
 static constexpr uint32_t ROUTE_LOOKUP_RETRY_MS = 600000;
 static constexpr uint32_t ROUTE_CACHE_STALE_MS = 60000;
@@ -194,6 +213,7 @@ struct Aircraft {
     float easeLat = 0;
     float easeLon = 0;
     uint32_t easeMs = 0;
+    uint32_t easeDurationMs = 0;
     bool hasEase = false;
     bool inside = false;
     bool hasFlight = false;
@@ -274,6 +294,14 @@ static RadarLabels::LabelLayoutOutput labelLayoutOutputs[MAX_AIRCRAFT];
 static RadarLabels::AircraftObstacle labelAircraftObstacles[MAX_AIRCRAFT];
 static RadarLabelRender radarLabels[MAX_AIRCRAFT];
 static char selectedAircraftHex[7] = {};
+
+struct LastDrawnPosition {
+    char hex[7] = {};
+    float lat = 0;
+    float lon = 0;
+    uint32_t ms = 0;
+};
+static LastDrawnPosition lastDrawnCache[MAX_AIRCRAFT];
 static char visibleListAircraftHex[PANEL_MAX_ROWS][7] = {};
 static size_t visibleListRowCount = 0;
 // The panel shows PANEL_MAX_ROWS at most while MAX_AIRCRAFT are tracked, so
@@ -2922,18 +2950,72 @@ static bool fetchAdsb() {
     // evaluating it at fetchNow gives exactly where the icon sits right now.
     for (size_t i = 0; i < fetchedCount; i++) {
         if (fetchedAircraft[i].hex[0] == '\0') continue;
+        bool matched = false;
+        float drawnLat = 0;
+        float drawnLon = 0;
         for (size_t j = 0; j < aircraftCount; j++) {
             if (strcmp(aircraft[j].hex, fetchedAircraft[i].hex) != 0) continue;
-            float drawnLat = 0;
-            float drawnLon = 0;
             extrapolatedPosition(aircraft[j], fetchNow, drawnLat, drawnLon);
+            matched = true;
+            break;
+        }
+        if (!matched) {
+            // Not in the previous fetch: fall back to where it was last drawn,
+            // if that was recent enough for the gap to be worth smoothing.
+            for (auto &remembered : lastDrawnCache) {
+                if (remembered.hex[0] == '\0') continue;
+                if (strcmp(remembered.hex, fetchedAircraft[i].hex) != 0) continue;
+                if (fetchNow - remembered.ms <= AIRCRAFT_REAPPEAR_EASE_MS) {
+                    drawnLat = remembered.lat;
+                    drawnLon = remembered.lon;
+                    matched = true;
+                }
+                break;
+            }
+        }
+        if (matched) {
             fetchedAircraft[i].easeLat = drawnLat;
             fetchedAircraft[i].easeLon = drawnLon;
             fetchedAircraft[i].easeMs = fetchNow;
+            // Spend long enough on the correction that the aircraft never
+            // appears to exceed AIRCRAFT_EASE_SPEED_FACTOR times its real speed.
+            float correctionKm = trackDistanceKm(
+                drawnLat, drawnLon,
+                fetchedAircraft[i].lat, fetchedAircraft[i].lon
+            );
+            float speedKmPerMs = fetchedAircraft[i].gsKnots * KM_PER_NM / 3600000.0f;
+            uint32_t needed = AIRCRAFT_POSITION_EASE_MIN_MS;
+            if (speedKmPerMs > 1e-9f && correctionKm > 0.0f) {
+                needed = static_cast<uint32_t>(
+                    correctionKm / (speedKmPerMs * AIRCRAFT_EASE_SPEED_FACTOR)
+                );
+            }
+            fetchedAircraft[i].easeDurationMs = std::min(
+                AIRCRAFT_POSITION_EASE_MAX_MS,
+                std::max(AIRCRAFT_POSITION_EASE_MIN_MS, needed)
+            );
             fetchedAircraft[i].hasEase = true;
-            break;
         }
     }
+
+    // Remember every aircraft's current position so a dropout can be eased on
+    // return. Slot reuse is by hex, else the oldest entry.
+    for (size_t i = 0; i < fetchedCount; i++) {
+        if (fetchedAircraft[i].hex[0] == '\0') continue;
+        LastDrawnPosition *slot = nullptr;
+        LastDrawnPosition *oldest = &lastDrawnCache[0];
+        for (auto &entry : lastDrawnCache) {
+            if (strcmp(entry.hex, fetchedAircraft[i].hex) == 0) { slot = &entry; break; }
+            if (entry.hex[0] == '\0') { slot = &entry; break; }
+            if (entry.ms < oldest->ms) oldest = &entry;
+        }
+        if (slot == nullptr) slot = oldest;
+        strlcpy(slot->hex, fetchedAircraft[i].hex, sizeof(slot->hex));
+        slot->lat = fetchedAircraft[i].lat;
+        slot->lon = fetchedAircraft[i].lon;
+        slot->ms = fetchNow;
+    }
+
     if (fetchedCount > 0) {
         memcpy(aircraft, fetchedAircraft, fetchedCount * sizeof(Aircraft));
     }
@@ -3000,11 +3082,14 @@ static void extrapolatedPosition(const Aircraft &item, uint32_t now, float &lat,
     if (!item.hasEase || now < item.easeMs) {
         return;
     }
+    uint32_t easeDuration = item.easeDurationMs > 0
+        ? item.easeDurationMs
+        : AIRCRAFT_POSITION_EASE_MIN_MS;
     uint32_t easeAge = now - item.easeMs;
-    if (easeAge >= AIRCRAFT_POSITION_EASE_MS) {
+    if (easeAge >= easeDuration) {
         return;
     }
-    float t = static_cast<float>(easeAge) / static_cast<float>(AIRCRAFT_POSITION_EASE_MS);
+    float t = static_cast<float>(easeAge) / static_cast<float>(easeDuration);
     t = t * t * (3.0f - 2.0f * t);   // smoothstep, so it leaves and arrives gently
     lat = item.easeLat + (lat - item.easeLat) * t;
     lon = item.easeLon + (lon - item.easeLon) * t;
