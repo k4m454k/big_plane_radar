@@ -25,6 +25,7 @@ FEED_LIMIT="${FEED_LIMIT:-64}"
 TAR1090_PORT="${TAR1090_PORT:-8080}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+HAVE_1090=0; HAVE_978=0
 LAT=""; LON=""; ALT="160"; TZONE="$(cat /etc/timezone 2>/dev/null || echo UTC)"
 SKIP_978=0
 
@@ -43,19 +44,33 @@ need_root() {
 # ---------------------------------------------------------------- dongles ----
 
 rtl_serials() {
-  # rtl_test writes its device list to stderr.
-  rtl_test -t 2>&1 | sed -n 's/^ *[0-9]*: *\(.*\)$/\1/p' || true
+  # rtl_test writes its device list to stderr, one line per device ending in
+  # "SN: <serial>".
+  rtl_test -t 2>&1 | sed -n 's/.*SN: *\([^ ,]*\).*/\1/p' || true
 }
 
 rtl_count() { rtl_serials | grep -c . || true; }
 
-serial_present() { rtl_serials | grep -q "$1"; }
+# Match on band rather than an exact string. Sticks sold pre-serialised for
+# ADS-B (ADSBexchange ships "1090" and "978") are already distinguishable, and
+# demanding an exact serial would send the user through a serialise step they do
+# not need. Anything containing the band number counts.
+detect_serials() {
+  local sns; sns="$(rtl_serials)"
+  local found_1090 found_978
+  found_1090="$(printf '%s\n' "$sns" | grep -m1 '1090' || true)"
+  found_978="$(printf '%s\n' "$sns" | grep '978' | grep -v '1090' | head -1 || true)"
+  [[ -n "$found_1090" ]] && SERIAL_1090="$found_1090"
+  [[ -n "$found_978" ]] && SERIAL_978="$found_978"
+  [[ -n "$found_1090" ]] && HAVE_1090=1 || HAVE_1090=0
+  [[ -n "$found_978" ]] && HAVE_978=1 || HAVE_978=0
+}
 
 cmd_serialise() {
   local which="${1:-}" serial
   case "$which" in
-    1090) serial="$SERIAL_1090" ;;
-    978)  serial="$SERIAL_978" ;;
+    1090) serial="00001090" ;;
+    978)  serial="00000978" ;;
     *) c_err "usage: $0 serialise <1090|978>"; exit 2 ;;
   esac
 
@@ -80,12 +95,11 @@ cmd_serialise() {
 
 check_serials() {
   local n; n="$(rtl_count)"
-  local have1090=0 have978=0
-  serial_present "$SERIAL_1090" && have1090=1
-  serial_present "$SERIAL_978" && have978=1
+  detect_serials
 
-  if [[ $have1090 -eq 1 && ( $have978 -eq 1 || $SKIP_978 -eq 1 ) ]]; then
-    c_ok "receivers identified ($n connected)"
+  if [[ $HAVE_1090 -eq 1 && ( $HAVE_978 -eq 1 || $SKIP_978 -eq 1 ) ]]; then
+    c_ok "1090 MHz receiver: serial '$SERIAL_1090'"
+    [[ $SKIP_978 -eq 0 ]] && c_ok "978 MHz receiver:  serial '$SERIAL_978'"
     return 0
   fi
 
