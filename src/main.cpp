@@ -66,6 +66,10 @@ static int PANEL_TEXT_X = 562;
 static int PANEL_RIGHT = 790;
 static constexpr int PANEL_LIST_TOP = 42;
 static constexpr int PANEL_ROW_H = 54;
+// Height reserved at the bottom of the side panel for the selected aircraft's
+// details. Claimed only while something is selected, so the list keeps its full
+// height the rest of the time.
+static constexpr int DETAIL_PANE_H = 112;
 static constexpr size_t PANEL_MAX_ROWS = 12;
 static size_t panelVisibleRows = 8;
 static constexpr int AIRCRAFT_LABEL_LINE_ADVANCE = 9;
@@ -82,7 +86,12 @@ static constexpr uint32_t WIFI_CONNECT_ATTEMPT_MS = 15000;
 static constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 12000;
 static constexpr uint32_t ADSB_FETCH_INTERVAL_MS = 5000;
 static constexpr uint32_t RADAR_DRAW_INTERVAL_MS = 0;
-static constexpr uint32_t AIRCRAFT_EXTRAPOLATE_MAX_MS = 30000;
+// Dead reckoning runs against a 5 s update cycle, so 30 s of unchecked
+// extrapolation let a stalled feed accumulate kilometres of fiction before the
+// next fix yanked the icon back. Cap it near two missed updates instead.
+static constexpr uint32_t AIRCRAFT_EXTRAPOLATE_MAX_MS = 8000;
+// How long to blend from the last drawn position to a newly received one.
+static constexpr uint32_t AIRCRAFT_POSITION_EASE_MS = 600;
 static constexpr uint32_t ROUTE_LOOKUP_INTERVAL_MS = 5000;
 static constexpr uint32_t ROUTE_LOOKUP_RETRY_MS = 600000;
 static constexpr uint32_t ROUTE_CACHE_STALE_MS = 60000;
@@ -172,10 +181,22 @@ struct Aircraft {
     int screenX = 0;
     int screenY = 0;
     uint32_t positionMs = 0;
+    // Where this aircraft was last drawn when a fresh position arrived. New
+    // fetches replace lat/lon outright, so without this the icon teleports from
+    // wherever dead reckoning had reached to wherever the truth is; the render
+    // eases out of it instead.
+    float easeLat = 0;
+    float easeLon = 0;
+    uint32_t easeMs = 0;
+    bool hasEase = false;
     bool inside = false;
     bool hasFlight = false;
     bool hasTrack = false;
 };
+
+// Declared early: both the fetch path and the debug telemetry route need to ask
+// where an aircraft is currently being drawn.
+static void extrapolatedPosition(const Aircraft &item, uint32_t now, float &lat, float &lon);
 
 struct RadarLabelLine {
     char text[32] = {};
@@ -602,9 +623,20 @@ static void updateAircraftTracksLocked(
     }
 
     if (selectedAircraftHex[0] != '\0') {
+        // An aircraft can be selected before it has accumulated any track, so
+        // absence of a track is not on its own a reason to drop the selection.
+        // Only let it go once the aircraft has also left the live list.
+        bool stillReported = false;
+        for (size_t i = 0; i < itemCount; i++) {
+            if (strcmp(items[i].hex, selectedAircraftHex) == 0) {
+                stillReported = true;
+                break;
+            }
+        }
         AircraftTrack *selected = findAircraftTrackLocked(selectedAircraftHex);
-        if (selected == nullptr ||
-            now - selected->lastSeenMs > TRACK_SELECTION_MISSING_MS) {
+        bool trackStale = selected == nullptr ||
+            now - selected->lastSeenMs > TRACK_SELECTION_MISSING_MS;
+        if (!stillReported && trackStale) {
             RADAR_LOGD("[track] selection cleared missing=%s\n", selectedAircraftHex);
             selectedAircraftHex[0] = '\0';
         }
@@ -1744,6 +1776,50 @@ static void startWebServer() {
         server.send(200, "text/plain", selectedAircraftHex);
     });
 
+    // Current rendered position of every aircraft, evaluated the same way the
+    // renderer does. Small enough to poll at video rate, which a 1.1 MB
+    // screenshot is not -- the only way to observe sub-second easing remotely.
+    server.on("/ui/positions", HTTP_GET, []() {
+        String out;
+        out.reserve(1024);
+        uint32_t now = millis();
+        lockState();
+        out += String(now);
+        out += '\n';
+        for (size_t i = 0; i < aircraftCount; i++) {
+            float lat = 0;
+            float lon = 0;
+            extrapolatedPosition(aircraft[i], now, lat, lon);
+            out += aircraft[i].hex;
+            out += ',';
+            out += String(lat, 6);
+            out += ',';
+            out += String(lon, 6);
+            out += ',';
+            out += String(aircraft[i].gsKnots, 0);
+            out += ',';
+            out += aircraft[i].callsign;
+            out += '\n';
+        }
+        // Rows the side panel is currently showing, so the list can be
+        // correlated against what is actually drawn on the radar.
+        out += "VISIBLE";
+        for (size_t r = 0; r < visibleListRowCount && r < PANEL_MAX_ROWS; r++) {
+            out += ',';
+            out += visibleListAircraftHex[r];
+        }
+        out += '\n';
+        out += "COUNTS,total=";
+        out += String(static_cast<unsigned>(aircraftCount));
+        out += ",listRows=";
+        out += String(static_cast<unsigned>(visibleListRowCount));
+        out += ",scroll=";
+        out += String(listScrollOffset);
+        out += '\n';
+        unlockState();
+        server.send(200, "text/plain", out);
+    });
+
     server.on("/ui/touch", HTTP_GET, []() {
         char body[420];
         snprintf(
@@ -2729,6 +2805,23 @@ static bool fetchAdsb() {
     char fetchStatus[24];
     snprintf(fetchStatus, sizeof(fetchStatus), "%u AIRCRAFT", static_cast<unsigned>(fetchedCount));
     lockState();
+    // Carry each aircraft's currently drawn position across the swap. The old
+    // entry still holds the data the renderer has been extrapolating from, so
+    // evaluating it at fetchNow gives exactly where the icon sits right now.
+    for (size_t i = 0; i < fetchedCount; i++) {
+        if (fetchedAircraft[i].hex[0] == '\0') continue;
+        for (size_t j = 0; j < aircraftCount; j++) {
+            if (strcmp(aircraft[j].hex, fetchedAircraft[i].hex) != 0) continue;
+            float drawnLat = 0;
+            float drawnLon = 0;
+            extrapolatedPosition(aircraft[j], fetchNow, drawnLat, drawnLon);
+            fetchedAircraft[i].easeLat = drawnLat;
+            fetchedAircraft[i].easeLon = drawnLon;
+            fetchedAircraft[i].easeMs = fetchNow;
+            fetchedAircraft[i].hasEase = true;
+            break;
+        }
+    }
     if (fetchedCount > 0) {
         memcpy(aircraft, fetchedAircraft, fetchedCount * sizeof(Aircraft));
     }
@@ -2771,27 +2864,38 @@ static bool toRadarPoint(float lat, float lon, int &x, int &y, float &distKm) {
 static void extrapolatedPosition(const Aircraft &item, uint32_t now, float &lat, float &lon) {
     lat = item.lat;
     lon = item.lon;
-    if (item.positionMs == 0 || item.gsKnots < 1.0f) {
+    if (item.positionMs != 0 && item.gsKnots >= 1.0f) {
+        uint32_t ageMs = now - item.positionMs;
+        if (ageMs > AIRCRAFT_EXTRAPOLATE_MAX_MS) {
+            ageMs = AIRCRAFT_EXTRAPOLATE_MAX_MS;
+        }
+
+        float distanceKm = item.gsKnots * KM_PER_NM * (static_cast<float>(ageMs) / 3600000.0f);
+        if (distanceKm >= 0.001f) {
+            float trackRad = item.trackDeg * DEG_TO_RAD;
+            float northKm = cosf(trackRad) * distanceKm;
+            float eastKm = sinf(trackRad) * distanceKm;
+            float lonScale = KM_PER_DEG * std::max(0.1f, fabsf(cosf(item.lat * DEG_TO_RAD)));
+
+            lat = item.lat + northKm / KM_PER_DEG;
+            lon = item.lon + eastKm / lonScale;
+        }
+    }
+
+    // Blend out of the position this aircraft was last drawn at, so a fresh fix
+    // corrects the prediction over a few frames rather than in one jump. The
+    // target keeps advancing during the blend, so motion stays continuous.
+    if (!item.hasEase || now < item.easeMs) {
         return;
     }
-
-    uint32_t ageMs = now - item.positionMs;
-    if (ageMs > AIRCRAFT_EXTRAPOLATE_MAX_MS) {
-        ageMs = AIRCRAFT_EXTRAPOLATE_MAX_MS;
-    }
-
-    float distanceKm = item.gsKnots * KM_PER_NM * (static_cast<float>(ageMs) / 3600000.0f);
-    if (distanceKm < 0.001f) {
+    uint32_t easeAge = now - item.easeMs;
+    if (easeAge >= AIRCRAFT_POSITION_EASE_MS) {
         return;
     }
-
-    float trackRad = item.trackDeg * DEG_TO_RAD;
-    float northKm = cosf(trackRad) * distanceKm;
-    float eastKm = sinf(trackRad) * distanceKm;
-    float lonScale = KM_PER_DEG * std::max(0.1f, fabsf(cosf(item.lat * DEG_TO_RAD)));
-
-    lat = item.lat + northKm / KM_PER_DEG;
-    lon = item.lon + eastKm / lonScale;
+    float t = static_cast<float>(easeAge) / static_cast<float>(AIRCRAFT_POSITION_EASE_MS);
+    t = t * t * (3.0f - 2.0f * t);   // smoothstep, so it leaves and arrives gently
+    lat = item.easeLat + (lat - item.easeLat) * t;
+    lon = item.easeLon + (lon - item.easeLon) * t;
 }
 
 static bool isInsideMapViewport(int x, int y) {
@@ -3319,7 +3423,26 @@ static void drawAircraftList(
     g.drawString(rangeTitle, PANEL_RIGHT, 10);
 
     int textWidth = PANEL_RIGHT - PANEL_TEXT_X;
-    int maxRows = static_cast<int>(panelVisibleRows);
+
+    // Give up the bottom of the panel to the detail pane while a selection is
+    // live, but only if that aircraft is actually still being reported.
+    bool hasSelection = false;
+    if (selectedHex != nullptr && selectedHex[0] != '\0') {
+        for (size_t i = 0; i < itemCount; i++) {
+            if (strcmp(items[i].hex, selectedHex) == 0) {
+                hasSelection = true;
+                break;
+            }
+        }
+    }
+    int listBottom = SCREEN_H - (hasSelection ? DETAIL_PANE_H : 0);
+    int maxRows = std::max(
+        1,
+        std::min(
+            static_cast<int>(panelVisibleRows),
+            (listBottom - PANEL_LIST_TOP - 2) / PANEL_ROW_H
+        )
+    );
     int drawn = 0;
 
     // Rows are drawn from the end of the sorted array backwards, so the scroll
@@ -3417,12 +3540,12 @@ static void drawAircraftList(
     }
 }
 
-// Expanded read-out for the tapped aircraft. Drawn over the radar rather than
-// inside the list so it costs no rows and composes with scrolling; the top-left
-// corner is the least useful part of the radar area, being outside the sweep
-// circle. Everything here is already carried on Aircraft but never surfaced.
+// Expanded read-out for the tapped aircraft, pinned to the bottom of the side
+// panel. Everything here is already carried on Aircraft but never surfaced in
+// the list rows. Returns the height consumed so the list above can be sized to
+// match; zero when nothing is selected.
 template <typename Gfx>
-static void drawSelectedAircraftCard(
+static int drawSelectedAircraftCard(
     Gfx &g,
     const Aircraft *items,
     size_t itemCount,
@@ -3430,7 +3553,7 @@ static void drawSelectedAircraftCard(
     size_t routeCount,
     const char *selectedHex
 ) {
-    if (selectedHex == nullptr || selectedHex[0] == '\0') return;
+    if (selectedHex == nullptr || selectedHex[0] == '\0') return 0;
 
     const Aircraft *sel = nullptr;
     for (size_t i = 0; i < itemCount; i++) {
@@ -3439,22 +3562,20 @@ static void drawSelectedAircraftCard(
             break;
         }
     }
-    if (sel == nullptr) return;
+    if (sel == nullptr) return 0;
 
-    constexpr int CARD_X = 8;
-    constexpr int CARD_Y = 8;
-    constexpr int CARD_W = 236;
-    constexpr int CARD_H = 152;
+    const int CARD_X = PANEL_X + 1;
+    const int CARD_W = SCREEN_W - PANEL_X - 2;
+    const int CARD_H = DETAIL_PANE_H;
+    const int CARD_Y = SCREEN_H - CARD_H;
 
     g.fillRect(CARD_X, CARD_Y, CARD_W, CARD_H, colorBg);
     g.drawWideLine(CARD_X, CARD_Y, CARD_X + CARD_W, CARD_Y, 1.0f, colorGrid);
-    g.drawWideLine(CARD_X, CARD_Y + CARD_H, CARD_X + CARD_W, CARD_Y + CARD_H, 1.0f, colorGrid);
-    g.drawWideLine(CARD_X + CARD_W, CARD_Y, CARD_X + CARD_W, CARD_Y + CARD_H, 1.0f, colorGrid);
     // Same warm marker the selected list row uses, so the two read as one selection.
-    g.fillRect(CARD_X, CARD_Y, 3, CARD_H, colorWarn);
+    g.fillRect(CARD_X, CARD_Y + 2, 3, CARD_H - 2, colorWarn);
 
     int tx = CARD_X + 12;
-    int ty = CARD_Y + 8;
+    int ty = CARD_Y + 6;
     int maxTextW = CARD_W - 24;
     char line[80];
 
@@ -3474,7 +3595,7 @@ static void drawSelectedAircraftCard(
         sel->hex[0] ? sel->hex : "------"
     );
     g.drawString(line, tx, ty);
-    ty += 16;
+    ty += 14;
 
     g.setTextColor(colorText, colorBg);
     snprintf(
@@ -3485,7 +3606,7 @@ static void drawSelectedAircraftCard(
         sel->vsi
     );
     g.drawString(line, tx, ty);
-    ty += 14;
+    ty += 13;
 
     char distance[16];
     char speed[16];
@@ -3494,16 +3615,13 @@ static void drawSelectedAircraftCard(
     snprintf(
         line,
         sizeof(line),
-        "%s  HDG %03d",
+        "%s  HDG %03d  %s",
         speed,
-        static_cast<int>(sel->trackDeg + 0.5f) % 360
+        static_cast<int>(sel->trackDeg + 0.5f) % 360,
+        distance
     );
     g.drawString(line, tx, ty);
-    ty += 14;
-
-    snprintf(line, sizeof(line), "DIST %s", distance);
-    g.drawString(line, tx, ty);
-    ty += 14;
+    ty += 13;
 
     if (sel->squawk[0]) {
         const char *alert = squawkAlertLabel(sel->squawk);
@@ -3518,7 +3636,7 @@ static void drawSelectedAircraftCard(
         g.setTextColor(alert != nullptr ? colorWarn : colorDim, colorBg);
         g.drawString(line, tx, ty);
     }
-    ty += 14;
+    ty += 13;
 
     char route[(ROUTE_CITY_MAX_LEN * 2) + 8];
     if (routeLabelForCallsign(
@@ -3526,6 +3644,7 @@ static void drawSelectedAircraftCard(
         g.setTextColor(colorRunway, colorBg);
         g.drawString(route, tx, ty);
     }
+    return CARD_H;
 }
 
 static void drawMapAttribution(PanelDisplay::Canvas &g) {
@@ -3837,6 +3956,19 @@ static bool handleAircraftListTap(uint16_t x, uint16_t y) {
         networkDataDirty = true;
     }
     unlockState();
+
+    // Selecting claims DETAIL_PANE_H from the bottom of the list, which can push
+    // the row that was just tapped off screen. Scroll far enough to keep it as
+    // the last visible row.
+    if (selected) {
+        int shrunkRows = std::max(
+            1,
+            (SCREEN_H - DETAIL_PANE_H - PANEL_LIST_TOP - 2) / PANEL_ROW_H
+        );
+        if (static_cast<int>(row) >= shrunkRows) {
+            listScrollOffset += static_cast<int>(row) - shrunkRows + 1;
+        }
+    }
 
     if (changed) {
         RADAR_LOGD(
