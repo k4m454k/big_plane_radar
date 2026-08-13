@@ -29,6 +29,33 @@ currently limits `PLANE_RADAR_RGB_BOUNCE_LINES` to 20.
   Quarter-wave is ~6.9 cm for 1090 MHz and ~7.7 cm for 978 MHz, so they are not
   interchangeable.
 
+## Quick start
+
+Flash Raspberry Pi OS Lite (64-bit), enable SSH, then:
+
+```sh
+git clone https://github.com/k4m454k/big_plane_radar
+cd big_plane_radar/pi-feed
+
+# one dongle connected at a time -- see "Serialising" below for why
+./bootstrap.sh serialise 1090     # ONLY the 1090 MHz receiver connected
+./bootstrap.sh serialise 978      # ONLY the 978 MHz receiver connected
+
+# both reconnected
+./bootstrap.sh install --lat 38.677024 --lon -90.506763 --alt 160
+```
+
+That handles the DVB-T blacklist, SDR tools, Docker, the receiver stack, the
+`radar-feed` service, and verification. It is idempotent — re-run it after
+changing position or fixing a failure. `./bootstrap.sh status` reports on
+receivers, containers, the service and both endpoints.
+
+Add `--no-978` for a 1090-only start; re-run without it when the second antenna
+is up.
+
+The rest of this document is what the script does, for when something needs
+fixing by hand.
+
 ## 1. Base OS
 
 Raspberry Pi OS Lite (64-bit). Enable SSH, set a hostname you will remember —
@@ -48,7 +75,7 @@ EOF
 sudo reboot
 ```
 
-## 3. Give each dongle a distinct serial
+## 3. Serialising the dongles
 
 **Do this before anything else, and with only one dongle plugged in at a time.**
 Two identical RTL-SDRs cannot be told apart by USB path reliably across reboots,
@@ -155,6 +182,8 @@ keys, then add the relevant `ULTRAFEEDER_CONFIG` entries per the
 This is entirely optional; the radar does not care.
 
 ## 7. pi-feed
+
+`bootstrap.sh install` does all of this; the manual equivalent is:
 
 `readsb` serves *everything the antennas hear*, unsorted. The firmware caps at
 `MAX_AIRCRAFT` (64), so handing it a raw busy feed would silently drop nearby
