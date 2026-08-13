@@ -48,6 +48,10 @@ public:
         float outerKm,
         int radarRadius,
         const String &apiKey,
+        // When non-empty, tiles are fetched from a pi-feed proxy over plain
+        // HTTP instead of Stadia over TLS. The proxy holds the API key and
+        // caches tiles, so the device needs neither a key nor a TLS stack.
+        const String &feedHost,
         uint8_t brightnessPercent,
         size_t viewIndex,
         LoadProgressCallback progressCallback = nullptr,
@@ -58,7 +62,10 @@ public:
     void clear();
 
 private:
-    static constexpr size_t MAX_VIEWS = 4;
+    // One cached view per radar range preset, so this must not be lower than
+    // RANGE_COUNT in main.cpp -- begin() rejects a larger viewCount and the map
+    // silently turns off.
+    static constexpr size_t MAX_VIEWS = 8;
     uint16_t *_buffers[MAX_VIEWS] = {};
     bool _ready[MAX_VIEWS] = {};
     size_t _viewCount = 0;

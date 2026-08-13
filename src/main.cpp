@@ -683,11 +683,19 @@ struct RangePreset {
     const char *miLabel;
 };
 
+// outerKm is the map extent to the panel corners; the label is the outer ring
+// radius, so outerKm runs about 1.33x the labelled figure.
+//
+// Each preset costs one cached map view in PSRAM (panel_width * height * 2, so
+// ~499 KB at 520x480) plus its tile downloads at boot, which is why the list is
+// short rather than a continuous zoom.
 static const RangePreset ranges[] = {
     {6.7f, "5km", "3mi"},
     {13.3f, "10km", "6mi"},
     {20.0f, "15km", "9mi"},
     {33.3f, "25km", "16mi"},
+    {66.7f, "50km", "31mi"},
+    {133.3f, "100km", "62mi"},
 };
 static constexpr size_t RANGE_COUNT = sizeof(ranges) / sizeof(ranges[0]);
 static size_t rangeIndex = 1;
@@ -1218,6 +1226,7 @@ static bool preloadMapCache() {
             ranges[i].outerKm,
             RADAR_RADIUS,
             config.stadiaApiKey,
+            config.useLocalFeed ? config.feedHost : String(),
             config.mapBrightness,
             i,
             updateMapBootProgress,
@@ -2376,13 +2385,35 @@ static void syncRouteCacheFromAircraft(uint32_t now) {
 }
 
 static bool lookupRouteForCallsign(RouteCacheEntry &entry) {
-    String url = "https://api.adsbdb.com/v0/callsign/";
+    // Prefer the local proxy: it caches results permanently and, more
+    // importantly, removes the last TLS handshake from this firmware.
+    String feedHost;
+    bool viaProxy = false;
+    lockState();
+    feedHost = config.feedHost;
+    viaProxy = config.useLocalFeed && feedHost.length() > 0;
+    unlockState();
+
+    String url;
+    if (viaProxy) {
+        url = "http://";
+        url += feedHost;
+        url += "/route/";
+    } else {
+        url = "https://api.adsbdb.com/v0/callsign/";
+    }
     url += entry.callsign;
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    std::unique_ptr<WiFiClient> client;
+    if (viaProxy) {
+        client.reset(new WiFiClient());
+    } else {
+        auto *secure = new WiFiClientSecure();
+        secure->setInsecure();
+        client.reset(secure);
+    }
     HTTPClient http;
-    if (!http.begin(client, url)) {
+    if (client == nullptr || !http.begin(*client, url)) {
         return false;
     }
     http.setTimeout(ROUTE_HTTP_TIMEOUT_MS);
@@ -2804,7 +2835,7 @@ static bool fetchAdsb() {
     const char *fields[] = {
         "lat", "lon", "track", "true_heading", "mag_heading", "dir",
         "gs", "tas", "ias", "baro_rate", "geom_rate", "flight", "hex",
-        "t", "category", "squawk", "alt_baro", "alt_geom"
+        "t", "category", "squawk", "alt_baro", "alt_geom", "seen_pos"
     };
     for (const char *field : fields) {
         filter["ac"][0][field] = true;
@@ -2848,7 +2879,19 @@ static bool fetchAdsb() {
             dst.lon = plane["lon"].as<float>();
             dst.renderLat = dst.lat;
             dst.renderLon = dst.lon;
-            dst.positionMs = fetchNow;
+            // Back-date to when the fix was actually taken. Treating a stale
+            // position as current makes dead reckoning run permanently ahead of
+            // the aircraft, so every refresh drags it backwards -- a ~0.4 km
+            // correction each poll at airliner speeds, which reads as a stutter.
+            float positionAgeS = 0;
+            readJsonFloat(plane, "seen_pos", positionAgeS);
+            uint32_t positionAgeMs = positionAgeS > 0
+                ? static_cast<uint32_t>(positionAgeS * 1000.0f)
+                : 0;
+            if (positionAgeMs > AIRCRAFT_EXTRAPOLATE_MAX_MS) {
+                positionAgeMs = AIRCRAFT_EXTRAPOLATE_MAX_MS;
+            }
+            dst.positionMs = positionAgeMs < fetchNow ? fetchNow - positionAgeMs : fetchNow;
             dst.noseDeg = pickHeading(plane, false);
             dst.trackDeg = pickHeading(plane, true);
             float rawTrack = 0;

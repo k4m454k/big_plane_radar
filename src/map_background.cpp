@@ -3,16 +3,19 @@
 
 #include <HTTPClient.h>
 #include <PNGdec.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <algorithm>
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <memory>
 #include <new>
 
 namespace RadarMap {
 
 static constexpr char STADIA_RASTER_TILE_URL[] =
     "https://tiles-eu.stadiamaps.com/tiles/alidade_smooth_dark/%d/%d/%d.png";
+static constexpr char PROXY_RASTER_TILE_URL[] = "http://%s/tiles/%d/%d/%d.png";
 static constexpr uint32_t MAP_HTTP_TIMEOUT_MS = 20000;
 static constexpr size_t MAP_MAX_PNG_BYTES = 256 * 1024;
 static constexpr int MAP_TILE_SIZE = 256;
@@ -387,12 +390,13 @@ static bool decodeTilePng(
 }
 
 static bool downloadTile(
-    WiFiClientSecure &client,
+    WiFiClient &client,
     HTTPClient &http,
     const MapGeometry &geometry,
     int64_t unwrappedTileX,
     int tileY,
     const String &apiKey,
+    const String &feedHost,
     uint16_t *strip,
     int stripWidth,
     int destinationX,
@@ -409,23 +413,25 @@ static bool downloadTile(
     emitProgress(progress, LoadPhase::Request, callback, callbackContext);
 
     char url[192];
-    snprintf(
-        url,
-        sizeof(url),
-        STADIA_RASTER_TILE_URL,
-        geometry.zoom,
-        tileX,
-        tileY
-    );
+    const bool viaProxy = feedHost.length() > 0;
+    if (viaProxy) {
+        snprintf(url, sizeof(url), PROXY_RASTER_TILE_URL,
+                 feedHost.c_str(), geometry.zoom, tileX, tileY);
+    } else {
+        snprintf(url, sizeof(url), STADIA_RASTER_TILE_URL,
+                 geometry.zoom, tileX, tileY);
+    }
     if (!http.begin(client, url)) {
         RADAR_LOGE("[map] tile HTTP begin failed z=%d x=%d y=%d\n",
                    geometry.zoom, tileX, tileY);
         emitProgress(progress, LoadPhase::Error, callback, callbackContext, "HTTP BEGIN FAILED");
         return false;
     }
-    String authorization = F("Stadia-Auth ");
-    authorization += apiKey;
-    http.addHeader(F("Authorization"), authorization);
+    if (!viaProxy) {
+        String authorization = F("Stadia-Auth ");
+        authorization += apiKey;
+        http.addHeader(F("Authorization"), authorization);
+    }
     int status = http.GET();
     progress.httpStatus = status;
     emitProgress(progress, LoadPhase::Response, callback, callbackContext);
@@ -536,8 +542,16 @@ bool Background::begin(int width, int height, size_t viewCount) {
     if (_mutex == nullptr) {
         _mutex = xSemaphoreCreateMutexStatic(&_mutexStorage);
     }
-    if (_mutex == nullptr || width <= 0 || height <= 0 ||
-        viewCount == 0 || viewCount > MAX_VIEWS) {
+    if (_mutex == nullptr || width <= 0 || height <= 0 || viewCount == 0) {
+        return false;
+    }
+    if (viewCount > MAX_VIEWS) {
+        // Silently returning here disables the map with no clue why; adding a
+        // range preset without raising MAX_VIEWS looks exactly like a missing
+        // API key.
+        RADAR_LOGE("[map] viewCount=%u exceeds MAX_VIEWS=%u; map disabled\n",
+                   static_cast<unsigned>(viewCount),
+                   static_cast<unsigned>(MAX_VIEWS));
         return false;
     }
     if (_viewCount > 0) {
@@ -580,12 +594,15 @@ bool Background::fetchStadia(
     float outerKm,
     int radarRadius,
     const String &apiKey,
+    const String &feedHost,
     uint8_t brightnessPercent,
     size_t viewIndex,
     LoadProgressCallback progressCallback,
     void *progressContext
 ) {
-    if (viewIndex >= _viewCount || _buffers[viewIndex] == nullptr || apiKey.isEmpty()) {
+    // The proxy supplies the key, so only a direct fetch needs one on-device.
+    if (viewIndex >= _viewCount || _buffers[viewIndex] == nullptr ||
+        (feedHost.isEmpty() && apiKey.isEmpty())) {
         return false;
     }
 
@@ -707,8 +724,16 @@ bool Background::fetchStadia(
         static_cast<unsigned>(stripPixels * sizeof(uint16_t))
     );
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    // Only build a TLS client when actually talking to Stadia.
+    std::unique_ptr<WiFiClient> clientHolder;
+    if (feedHost.length() > 0) {
+        clientHolder.reset(new WiFiClient());
+    } else {
+        auto *secure = new WiFiClientSecure();
+        secure->setInsecure();
+        clientHolder.reset(secure);
+    }
+    WiFiClient &client = *clientHolder;
     HTTPClient http;
     http.setTimeout(MAP_HTTP_TIMEOUT_MS);
     http.setReuse(true);
@@ -731,6 +756,7 @@ bool Background::fetchStadia(
                 geometry.tileMinX + tileColumn,
                 tileY,
                 apiKey,
+                feedHost,
                 strip,
                 stripWidth,
                 tileColumn * MAP_TILE_SIZE,

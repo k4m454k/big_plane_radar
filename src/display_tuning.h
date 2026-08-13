@@ -26,12 +26,24 @@
 // rated minimum, not merely tuned low. Elecrow's own demo runs 15 MHz and is
 // out of spec too, so it is not a safe reference for this value.
 //
-// The cost is PSRAM bandwidth: the panel streams pclk * 2 bytes/s, so 33.3 MHz
-// is ~67 MB/s. If artefacts appear, step down toward 25 MHz rather than below
-// 20. Raising PLANE_RADAR_RGB_BOUNCE_LINES is not an option -- 30 starves the
-// TLS handshake and kills the ADS-B feed.
+// The panel's rating is only half the constraint: every pixel is streamed out of
+// PSRAM, so the clock also has to fit the SoC's memory bandwidth.
+//
+//   pclk * 2 bytes/pixel = sustained PSRAM read
+//   33.3 MHz -> 66.6 MB/s   measured on hardware: the image drifts sideways.
+//   21.0 MHz -> 42.0 MB/s   stable.
+//
+// Octal PSRAM at 80 MHz gives roughly 40-60 MB/s in practice, and this build
+// also fetches code and rodata from PSRAM (XIP), competing for the same bus.
+// Past that ceiling the RGB DMA underruns, lines start at the wrong horizontal
+// offset and the error accumulates as a sideways walk.
+//
+// So the usable window is bounded at both ends: below 20 MHz is outside the
+// panel's spec and flickers, above roughly 21 MHz the SoC cannot keep the
+// peripheral fed. Do not raise this without checking for drift on real
+// hardware -- it looks fine in a framebuffer screenshot either way.
 #ifndef PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ
-#define PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ (33300000)
+#define PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ (21 * 1000 * 1000)
 #endif
 
 // 0: auto, 7: ESP32-S3-Touch-LCD-7, 8: ESP32-S3-Touch-LCD-7B,

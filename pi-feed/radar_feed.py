@@ -41,9 +41,23 @@ PASSTHROUGH_FIELDS = (
     "lat", "lon", "track", "true_heading", "mag_heading", "dir",
     "gs", "tas", "ias", "baro_rate", "geom_rate", "flight", "hex",
     "t", "category", "squawk", "alt_baro", "alt_geom",
+    # Age of the position fix in seconds. Without it the firmware treats every
+    # fix as current and dead-reckons forward from a position that is already
+    # stale, so it runs permanently ahead and each new fix drags it back.
+    "seen_pos",
 )
 
 UPSTREAM_TEMPLATE = "https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}/dist/{dist}"
+ROUTE_TEMPLATE = "https://api.adsbdb.com/v0/callsign/{callsign}"
+TILE_TEMPLATE = ("https://tiles-eu.stadiamaps.com/tiles/alidade_smooth_dark/"
+                 "{z}/{x}/{y}.png?api_key={key}")
+
+# Routes and tiles are both effectively immutable: a flight number's endpoints do
+# not change, and a map tile at a given z/x/y is fixed. Caching them here means
+# the display never opens a TLS connection -- the single largest transient
+# allocation it makes, and what caps its RGB bounce buffers.
+ROUTE_TTL_S = 7 * 24 * 3600
+CACHE_DIR = os.environ.get("RADAR_FEED_CACHE", "/var/cache/radar-feed")
 
 KM_PER_DEG = 111.195
 KM_PER_NM = 1.852
@@ -51,6 +65,9 @@ KM_PER_NM = 1.852
 # readsb rewrites aircraft.json about once a second; re-reading faster than that
 # only burns I/O. Several devices polling at 5 s share one cached read.
 CACHE_TTL_S = 0.8
+
+# Drop positions older than this. Matches the firmware's extrapolation cap.
+STALE_POSITION_S = 8.0
 
 
 def urlopen(url, timeout):
@@ -73,6 +90,13 @@ def urlopen(url, timeout):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+
+def cache_path(kind, name):
+    d = os.path.join(CACHE_DIR, kind)
+    os.makedirs(d, exist_ok=True)
+    safe = "".join(c for c in name if c.isalnum() or c in "-_.")
+    return os.path.join(d, safe)
 
 
 class FeedCache:
@@ -131,6 +155,13 @@ def select(aircraft, lat, lon, dist_nm, limit):
         plon = plane.get("lon")
         if not isinstance(plat, (int, float)) or not isinstance(plon, (int, float)):
             continue
+        # readsb keeps aircraft listed for up to a minute after their last
+        # position. The firmware caps dead reckoning at 8 s, so anything older
+        # than that arrives already beyond what it can project and lands as a
+        # visible jump when the next real fix appears. Better to omit it.
+        age = plane.get("seen_pos")
+        if isinstance(age, (int, float)) and age > STALE_POSITION_S:
+            continue
         d = distance_km(float(plat), float(plon), lat, lon)
         if d > radius_km:
             continue
@@ -180,6 +211,62 @@ class Handler(BaseHTTPRequestHandler):
             }, indent=1))
             return
 
+        # /route/<callsign> -- cached flight route lookup
+        if len(parts) == 2 and parts[0] == "route" and parts[1]:
+            callsign = parts[1].strip().upper()[:12]
+            path_c = cache_path("route", callsign + ".json")
+            try:
+                age = time.time() - os.path.getmtime(path_c)
+                if age < ROUTE_TTL_S:
+                    with open(path_c, "rb") as f:
+                        self._send(200, f.read())
+                        return
+            except OSError:
+                pass
+            try:
+                with urlopen(ROUTE_TEMPLATE.format(callsign=callsign), timeout=6) as r:
+                    body = r.read()
+            except Exception as exc:  # noqa: BLE001
+                # Negative results are worth caching too: an unknown callsign
+                # would otherwise be re-queried on every poll forever.
+                body = json.dumps({"response": "unknown callsign"}).encode()
+                if "404" not in str(exc):
+                    self._send(502, json.dumps({"error": str(exc)}))
+                    return
+            with open(path_c, "wb") as f:
+                f.write(body)
+            self._send(200, body)
+            return
+
+        # /tiles/<z>/<x>/<y>.png -- cached map tile
+        if len(parts) == 4 and parts[0] == "tiles":
+            try:
+                z, x = int(parts[1]), int(parts[2])
+                y = int(parts[3].split(".")[0])
+            except ValueError:
+                self._send(400, b"bad tile", "text/plain")
+                return
+            name = "%d_%d_%d.png" % (z, x, y)
+            path_c = cache_path("tiles", name)
+            if os.path.exists(path_c):
+                with open(path_c, "rb") as f:
+                    self._send(200, f.read(), "image/png")
+                    return
+            key = self.server.stadia_key
+            if not key:
+                self._send(503, b"no stadia key configured", "text/plain")
+                return
+            try:
+                with urlopen(TILE_TEMPLATE.format(z=z, x=x, y=y, key=key), timeout=10) as r:
+                    body = r.read()
+            except Exception as exc:  # noqa: BLE001
+                self._send(502, str(exc).encode(), "text/plain")
+                return
+            with open(path_c, "wb") as f:
+                f.write(body)
+            self._send(200, body, "image/png")
+            return
+
         # /api/v3/lat/<lat>/lon/<lon>/dist/<nm>
         if len(parts) == 8 and parts[:2] == ["api", "v3"] and \
                 parts[2] == "lat" and parts[4] == "lon" and parts[6] == "dist":
@@ -225,6 +312,8 @@ def main():
         "RADAR_FEED_SOURCE", "http://127.0.0.1/data/aircraft.json"))
     ap.add_argument("--limit", type=int, default=int(os.environ.get("RADAR_FEED_LIMIT", 64)),
                     help="max aircraft returned; must not exceed the firmware's MAX_AIRCRAFT")
+    ap.add_argument("--stadia-key", default=os.environ.get("RADAR_FEED_STADIA_KEY", ""),
+                    help="Stadia Maps key, so the display need not hold one")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -232,6 +321,7 @@ def main():
     server.cache = FeedCache(args.source)
     server.limit = args.limit
     server.verbose = args.verbose
+    server.stadia_key = args.stadia_key
     print("radar-feed: source=%s bind=%s:%d limit=%d" %
           (args.source, args.bind, args.port, args.limit), flush=True)
     try:
