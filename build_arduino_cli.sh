@@ -81,6 +81,17 @@ case "$DEFAULT_MAP_PROVIDER" in
 esac
 
 DISPLAY_PROFILE="${DISPLAY_PROFILE:-0}"
+# Opt-in /ui/* HTTP routes for driving the display remotely. Off by default:
+# they let anyone on the network operate the UI.
+DEBUG_UI="${DEBUG_UI:-0}"
+
+case "$DEBUG_UI" in
+  0|1) ;;
+  *)
+    echo "DEBUG_UI must be 0 or 1." >&2
+    exit 1
+    ;;
+esac
 
 # The Waveshare boards ship 16 MB of flash; the CrowPanel has 4 MB, so it needs
 # its own layout. The firmware has no OTA path, which frees profile 9 to use
@@ -123,6 +134,7 @@ CPP_FLAGS="$COMMON_FLAGS"
 CPP_FLAGS+=" -DPLANE_RADAR_LOG_LEVEL=$APP_LOG_LEVEL"
 CPP_FLAGS+=" -DPLANE_RADAR_RGB_BOUNCE_LINES=$RGB_BOUNCE_LINES"
 CPP_FLAGS+=" -DPLANE_RADAR_DISPLAY_PROFILE=$DISPLAY_PROFILE$PROFILE_FLAGS"
+CPP_FLAGS+=" -DPLANE_RADAR_DEBUG_UI=$DEBUG_UI"
 CPP_FLAGS+=" -DPLANE_RADAR_REQUIRE_HIGH_PERF=$REQUIRE_HIGH_PERF"
 CPP_FLAGS+=" -DDEFAULT_WIFI_SSID=$(c_define_string "$DEFAULT_WIFI_SSID")"
 CPP_FLAGS+=" -DDEFAULT_WIFI_PASSWORD=$(c_define_string "$DEFAULT_WIFI_PASSWORD")"

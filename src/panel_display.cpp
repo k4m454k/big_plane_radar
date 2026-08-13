@@ -568,7 +568,16 @@ bool Canvas::begin() {
         std::fill(_driverFb[0], _driverFb[0] + pixels, TFT_BLACK);
         std::fill(_driverFb[1], _driverFb[1] + pixels, TFT_BLACK);
         refreshFinishedSemaphore = xSemaphoreCreateBinaryStatic(&refreshFinishedSemaphoreStorage);
-        if (refreshFinishedSemaphore == nullptr || !lcd->attachRefreshFinishCallback(onRefreshFinished)) {
+        // Pass real internal-RAM user data rather than letting it default to
+        // nullptr. When XIP-on-PSRAM is off the driver asserts the ISR's user
+        // data lives in SRAM, and esp_ptr_internal(nullptr) is false; with XIP
+        // on, that check is compiled out entirely, which is the only reason a
+        // null pointer ever worked here. The semaphore storage is a plain
+        // static, so it is in .bss and satisfies the check for both SDKs.
+        if (refreshFinishedSemaphore == nullptr ||
+            !lcd->attachRefreshFinishCallback(
+                onRefreshFinished, &refreshFinishedSemaphoreStorage
+            )) {
             RADAR_LOGE("[display] refresh synchronization setup failed\n");
             return false;
         }
