@@ -1252,6 +1252,40 @@ static void setUnavailableMapBootStatus() {
     }
 }
 
+// Fetches the map for whichever range is on screen, if no buffer currently
+// holds it. With fewer buffers than ranges, this is what makes the outermost
+// ranges reachable at all: the least recently drawn view gives up its slot.
+static bool ensureMapForCurrentRange() {
+    if (config.mapProvider == MapProvider::None || !mapRuntimeReady) return false;
+    if (config.stadiaApiKey.isEmpty() && !config.useLocalFeed) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    size_t wanted = 0;
+    lockState();
+    wanted = rangeIndex;
+    unlockState();
+    if (wanted >= RANGE_COUNT) return false;
+    if (RadarMap::background.hasSlot(wanted)) return false;
+
+    RADAR_LOGI("[map] fetching view %u on demand\n", static_cast<unsigned>(wanted));
+    bool ok = RadarMap::background.fetchStadia(
+        config.lat,
+        config.lon,
+        ranges[wanted].outerKm,
+        RADAR_RADIUS,
+        config.stadiaApiKey,
+        config.useLocalFeed ? config.feedHost : String(),
+        config.mapBrightness,
+        wanted
+    );
+    if (ok) {
+        lockState();
+        networkDataDirty = true;
+        unlockState();
+    }
+    return ok;
+}
+
 static bool preloadMapCache() {
     if (config.mapProvider == MapProvider::None) {
         setBootStageDetails(BOOT_MAP, "MAP BACKGROUND DISABLED", "PLAIN RADAR MODE SELECTED");
@@ -4965,6 +4999,7 @@ static void networkTaskMain(void *) {
             }
 
             serviceRouteLookup();
+            ensureMapForCurrentRange();
         }
 
         AppWatchdog::feed();

@@ -59,15 +59,30 @@ public:
     );
     bool draw(PanelDisplay::Canvas &canvas, size_t viewIndex);
     bool isReady(size_t viewIndex);
+    // Whether a buffer is currently assigned to this view. False means the view
+    // has to be fetched before it can be drawn, which is the caller's cue.
+    bool hasSlot(size_t viewIndex);
     void clear();
 
 private:
-    // One cached view per radar range preset, so this must not be lower than
-    // RANGE_COUNT in main.cpp -- begin() rejects a larger viewCount and the map
-    // silently turns off.
+    // Buffers are assigned to range presets on demand rather than one each.
+    // A 1024x600 panel only has room for three at 816 KB apiece, so fixing a
+    // buffer per range index meant the outermost ranges could never show a map
+    // however long you sat on them -- while an inner range nobody was looking
+    // at held one. Slots are claimed by whichever range is actually being
+    // viewed, evicting the least recently used.
     static constexpr size_t MAX_VIEWS = 8;
+    static constexpr size_t kNoView = static_cast<size_t>(-1);
+    int slotFor(size_t viewIndex) const;
+    int claimSlot(size_t viewIndex);
     uint16_t *_buffers[MAX_VIEWS] = {};
     bool _ready[MAX_VIEWS] = {};
+    size_t _slotView[MAX_VIEWS] = {};
+    uint32_t _slotUse[MAX_VIEWS] = {};
+    uint32_t _useCounter = 0;
+    // Allocated buffers, which may be fewer than the range presets.
+    size_t _slotCount = 0;
+    // Range presets, i.e. the range of valid viewIndex values.
     size_t _viewCount = 0;
     int _width = 0;
     int _height = 0;

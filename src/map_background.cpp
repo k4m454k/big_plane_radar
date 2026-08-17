@@ -563,6 +563,9 @@ bool Background::begin(int width, int height, size_t viewCount) {
         return width == _width && height == _height && viewCount == _viewCount;
     }
 
+    // viewCount is reduced below to whatever memory allows; the caller's value
+    // stays the number of ranges a view may be requested for.
+    const size_t requestedViews = viewCount;
     size_t bytes = static_cast<size_t>(width) * height * sizeof(uint16_t);
     for (size_t i = 0; i < viewCount; i++) {
         // Stop before the cache eats the PSRAM the tile decoder needs. Building
@@ -613,8 +616,13 @@ bool Background::begin(int width, int height, size_t viewCount) {
     }
     _width = width;
     _height = height;
-    _viewCount = viewCount;
+    _slotCount = viewCount;
+    _viewCount = requestedViews;
     memset(_ready, 0, sizeof(_ready));
+    for (size_t i = 0; i < MAX_VIEWS; i++) {
+        _slotView[i] = kNoView;
+        _slotUse[i] = 0;
+    }
     RADAR_LOGI("[map] cache ready size=%dx%d views=%u bytes=%u free_psram=%u\n",
                width,
                height,
@@ -637,13 +645,22 @@ bool Background::fetchStadia(
     void *progressContext
 ) {
     // The proxy supplies the key, so only a direct fetch needs one on-device.
-    if (viewIndex >= _viewCount || _buffers[viewIndex] == nullptr ||
+    if (viewIndex >= _viewCount || _slotCount == 0 ||
         (feedHost.isEmpty() && apiKey.isEmpty())) {
         return false;
     }
 
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    _ready[viewIndex] = false;
+    int slot = claimSlot(viewIndex);
+    if (slot < 0 || _buffers[slot] == nullptr) {
+        xSemaphoreGive(_mutex);
+        return false;
+    }
+    // Taking the slot from whatever held it before: that view stops being
+    // drawable the moment this one starts rendering over its pixels.
+    _slotView[slot] = viewIndex;
+    _slotUse[slot] = ++_useCounter;
+    _ready[slot] = false;
     xSemaphoreGive(_mutex);
 
     MapGeometry geometry = mapGeometry(
@@ -811,7 +828,7 @@ bool Background::fetchStadia(
             strip,
             stripWidth,
             rowBase,
-            _buffers[viewIndex],
+            _buffers[slot],
             _width,
             _height,
             brightness,
@@ -843,7 +860,7 @@ bool Background::fetchStadia(
     }
 
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    _ready[viewIndex] = true;
+    _ready[slot] = true;
     xSemaphoreGive(_mutex);
     progress.tileIndex = progress.tileCount;
     progress.receivedBytes = 0;
@@ -860,12 +877,37 @@ bool Background::fetchStadia(
     return true;
 }
 
+int Background::slotFor(size_t viewIndex) const {
+    for (size_t i = 0; i < _slotCount; i++) {
+        if (_slotView[i] == viewIndex) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// The slot already holding this view, else a free one, else the least recently
+// drawn. Evicting the least recently used is what lets a display with fewer
+// buffers than ranges still show a map on whichever range is being looked at.
+int Background::claimSlot(size_t viewIndex) {
+    int existing = slotFor(viewIndex);
+    if (existing >= 0) return existing;
+    for (size_t i = 0; i < _slotCount; i++) {
+        if (_slotView[i] == kNoView) return static_cast<int>(i);
+    }
+    size_t oldest = 0;
+    for (size_t i = 1; i < _slotCount; i++) {
+        if (_slotUse[i] < _slotUse[oldest]) oldest = i;
+    }
+    return static_cast<int>(oldest);
+}
+
 bool Background::draw(PanelDisplay::Canvas &canvas, size_t viewIndex) {
     if (_mutex == nullptr || viewIndex >= _viewCount) return false;
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    bool ready = _ready[viewIndex] && _buffers[viewIndex] != nullptr;
+    int slot = slotFor(viewIndex);
+    bool ready = slot >= 0 && _ready[slot] && _buffers[slot] != nullptr;
     if (ready) {
-        canvas.blitRGB565(0, 0, _width, _height, _buffers[viewIndex], _width);
+        _slotUse[slot] = ++_useCounter;
+        canvas.blitRGB565(0, 0, _width, _height, _buffers[slot], _width);
     }
     xSemaphoreGive(_mutex);
     return ready;
@@ -874,15 +916,25 @@ bool Background::draw(PanelDisplay::Canvas &canvas, size_t viewIndex) {
 bool Background::isReady(size_t viewIndex) {
     if (_mutex == nullptr || viewIndex >= _viewCount) return false;
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    bool ready = _ready[viewIndex];
+    int slot = slotFor(viewIndex);
+    bool ready = slot >= 0 && _ready[slot];
     xSemaphoreGive(_mutex);
     return ready;
+}
+
+bool Background::hasSlot(size_t viewIndex) {
+    if (_mutex == nullptr || viewIndex >= _viewCount) return false;
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    bool held = slotFor(viewIndex) >= 0;
+    xSemaphoreGive(_mutex);
+    return held;
 }
 
 void Background::clear() {
     if (_mutex == nullptr) return;
     xSemaphoreTake(_mutex, portMAX_DELAY);
     memset(_ready, 0, sizeof(_ready));
+    for (size_t i = 0; i < MAX_VIEWS; i++) _slotView[i] = kNoView;
     xSemaphoreGive(_mutex);
 }
 
