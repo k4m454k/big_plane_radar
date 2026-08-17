@@ -22,6 +22,7 @@ namespace PanelDisplay {
 enum class Model : uint8_t {
     TouchLcd7,
     TouchLcd7B,
+    TouchLcd5,
     CrowPanel7,
 };
 

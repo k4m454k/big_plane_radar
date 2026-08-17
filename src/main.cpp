@@ -38,6 +38,9 @@
 #ifndef DEFAULT_STADIA_API_KEY
 #define DEFAULT_STADIA_API_KEY ""
 #endif
+#ifndef DEFAULT_FEED_HOST
+#define DEFAULT_FEED_HOST ""
+#endif
 
 enum class MapProvider : uint8_t {
     None = 0,
@@ -111,6 +114,7 @@ static constexpr float AIRCRAFT_EASE_SPEED_FACTOR = 1.5f;
 // drawn for this long so a brief dropout is smoothed; past it the gap is real
 // and snapping is honest, since the intervening track is genuinely unknown.
 static constexpr uint32_t AIRCRAFT_REAPPEAR_EASE_MS = 10000;
+static constexpr uint32_t AIRCRAFT_STALE_MS = 20000;
 static constexpr uint32_t ROUTE_LOOKUP_INTERVAL_MS = 5000;
 static constexpr uint32_t ROUTE_LOOKUP_RETRY_MS = 600000;
 static constexpr uint32_t ROUTE_CACHE_STALE_MS = 60000;
@@ -141,7 +145,9 @@ static Preferences prefs;
 static void configureDisplayLayout() {
     SCREEN_W = screen.width();
     SCREEN_H = screen.height();
-    PANEL_X = screen.model() == PanelDisplay::Model::TouchLcd7B
+    // Both 1024x600 boards get the wider split; 800x480 keeps 520.
+    PANEL_X = (screen.model() == PanelDisplay::Model::TouchLcd7B ||
+               screen.model() == PanelDisplay::Model::TouchLcd5)
         ? 680
         : 520;
     PANEL_X = std::min(PANEL_X, SCREEN_W - 240);
@@ -184,6 +190,10 @@ struct AppConfig {
     String feedHost;
     bool useLocalFeed = false;
     bool configured = false;
+    // Whether the position came from the receiver rather than the compiled-in
+    // fallback. The display says so on screen instead of quietly drawing the
+    // wrong sky, which is how an unconfigured board silently showed London.
+    bool sitePositionKnown = false;
 };
 
 struct Aircraft {
@@ -291,6 +301,19 @@ static TrackPoint renderTrack[TRACK_POINTS_PER_AIRCRAFT];
 static RadarLabels::LabelLayout aircraftLabelLayout;
 static RadarLabels::LabelLayoutInput labelLayoutInputs[MAX_AIRCRAFT];
 static RadarLabels::LabelLayoutOutput labelLayoutOutputs[MAX_AIRCRAFT];
+#if PLANE_RADAR_DEBUG_UI
+// Last solved label placement per drawn label, for measuring whether the
+// force-directed layout actually settles. Written on the render task, read by
+// the debug endpoint; torn reads are acceptable for telemetry.
+struct DebugLabelPlacement {
+    uint32_t id;
+    float x;
+    float y;
+    bool visible;
+};
+static DebugLabelPlacement debugLabelPlacements[MAX_AIRCRAFT];
+static size_t debugLabelPlacementCount = 0;
+#endif
 static RadarLabels::AircraftObstacle labelAircraftObstacles[MAX_AIRCRAFT];
 static RadarLabelRender radarLabels[MAX_AIRCRAFT];
 static char selectedAircraftHex[7] = {};
@@ -369,6 +392,10 @@ static bool webServerStarted = false;
 static bool wifiReconnectInProgress = false;
 static bool wifiWasConnected = false;
 static bool forceAdsbFetch = false;
+// Set when a site-wide setting is changed on this panel. The POST itself happens
+// on the network task: doing it inline would block the frame loop on a round
+// trip to the Pi every time a setting is tapped.
+static bool siteConfigDirty = false;
 static bool mapRuntimeReady = false;
 static uint32_t wifiReconnectStartedMs = 0;
 static uint32_t lastReconnectMs = 0;
@@ -727,6 +754,10 @@ static const RangePreset ranges[] = {
 };
 static constexpr size_t RANGE_COUNT = sizeof(ranges) / sizeof(ranges[0]);
 static size_t rangeIndex = 1;
+// Set once this panel's range has been chosen on the panel itself. Until then the
+// Pi's range is taken as the default, which is what lets a second display come up
+// sensibly without forcing both panels to share one zoom.
+static bool rangeIsLocal = false;
 
 static uint16_t colorBg;
 static uint16_t colorGrid;
@@ -1417,14 +1448,24 @@ static void loadConfig() {
         ? MapProvider::Stadia
         : MapProvider::None;
     config.stadiaApiKey = prefs.getString("stadiaKey", DEFAULT_STADIA_API_KEY);
-    config.feedHost = prefs.getString("feedHost", "");
-    config.useLocalFeed = prefs.getBool("feedLocal", false) && config.feedHost.length() > 0;
+    config.feedHost = prefs.getString("feedHost", DEFAULT_FEED_HOST);
+    // A baked-in feed host is an explicit statement that this build belongs to
+    // that Pi, so it defaults to enabled -- otherwise the display would sit
+    // there with the address it needs and still ask the public API for data.
+    config.useLocalFeed =
+        prefs.getBool("feedLocal", config.feedHost.length() > 0) && config.feedHost.length() > 0;
     config.mapBrightness = static_cast<uint8_t>(std::max(
         static_cast<int>(MAP_BRIGHTNESS_MIN),
         std::min(100, static_cast<int>(prefs.getUChar("mapBright", MAP_BRIGHTNESS_DEFAULT)))
     ));
     config.configured = prefs.getBool("configured", config.ssid.length() > 0);
-    rangeIndex = std::min<size_t>(prefs.getUChar("range", 1), RANGE_COUNT - 1);
+    // 255 means this panel has never had a range chosen on it, so the Pi's
+    // range_index is used instead. Any local choice wins from then on.
+    uint8_t storedRange = prefs.getUChar("range", 255);
+    rangeIsLocal = storedRange != 255;
+    if (rangeIsLocal) {
+        rangeIndex = std::min<size_t>(storedRange, RANGE_COUNT - 1);
+    }
 }
 
 static void saveConfig() {
@@ -1454,6 +1495,7 @@ static void saveConfig() {
 
 static void saveRange() {
     prefs.putUChar("range", static_cast<uint8_t>(rangeIndex));
+    rangeIsLocal = true;
 }
 
 static void drawStatusScreen(const String &title, const String &body) {
@@ -1885,6 +1927,19 @@ static void startWebServer() {
             out += visibleListAircraftHex[r];
         }
         out += '\n';
+#if PLANE_RADAR_DEBUG_UI
+        for (size_t i = 0; i < debugLabelPlacementCount; i++) {
+            out += "LABEL,";
+            out += String(debugLabelPlacements[i].id);
+            out += ',';
+            out += String(debugLabelPlacements[i].x, 1);
+            out += ',';
+            out += String(debugLabelPlacements[i].y, 1);
+            out += ',';
+            out += debugLabelPlacements[i].visible ? '1' : '0';
+            out += '\n';
+        }
+#endif
         out += "COUNTS,total=";
         out += String(static_cast<unsigned>(aircraftCount));
         out += ",listRows=";
@@ -2740,6 +2795,172 @@ static void setLastFetchText(const String &text) {
     unlockState();
 }
 
+// Applies the site settings pi-feed serves. The receiver already knows where it
+// is, so the display never stores a position: this is what stops a freshly
+// flashed board from drawing a sky nobody is standing under.
+//
+// Range is deliberately excluded when this display has its own saved range --
+// two panels on one receiver should be able to sit at different zooms.
+static void applySiteConfig(JsonDocument &doc) {
+    lockState();
+    if (doc["position_known"].as<bool>()) {
+        config.lat = doc["lat"].as<double>();
+        config.lon = doc["lon"].as<double>();
+        config.sitePositionKnown = true;
+    } else {
+        config.sitePositionKnown = false;
+    }
+    config.miles = doc["miles"] | config.miles;
+    config.showRunways = doc["runways"] | config.showRunways;
+    config.airportSelectionMode = (doc["airport_mode"] | 0) ==
+            static_cast<int>(AirportSelectionMode::Manual)
+        ? AirportSelectionMode::Manual
+        : AirportSelectionMode::Automatic;
+    config.airportCount = static_cast<uint8_t>(std::max(
+        1,
+        std::min(
+            static_cast<int>(AIRPORT_COUNT_MAX),
+            static_cast<int>(doc["airport_count"] | static_cast<int>(AIRPORT_COUNT_DEFAULT))
+        )
+    ));
+    config.airportRadiusKm = static_cast<uint16_t>(std::max(
+        static_cast<int>(AIRPORT_RADIUS_MIN_KM),
+        std::min(
+            static_cast<int>(AIRPORT_RADIUS_MAX_KM),
+            static_cast<int>(doc["airport_radius_km"] |
+                             static_cast<int>(AIRPORT_RADIUS_DEFAULT_KM))
+        )
+    ));
+    config.manualAirportIcao = normalizeAirportIcao(doc["airport_icao"] | "");
+    config.showLabelCallsign = doc["label_callsign"] | config.showLabelCallsign;
+    config.showLabelType = doc["label_type"] | config.showLabelType;
+    config.showLabelAltitude = doc["label_altitude"] | config.showLabelAltitude;
+    config.showLabelVerticalRate = doc["label_vsi"] | config.showLabelVerticalRate;
+    config.aircraftSymbolStyle = (doc["symbols"] | 0) ==
+            static_cast<int>(AircraftSymbolStyle::Classic)
+        ? AircraftSymbolStyle::Classic
+        : AircraftSymbolStyle::DetailedIcons;
+    config.mapBrightness = static_cast<uint8_t>(std::max(
+        static_cast<int>(MAP_BRIGHTNESS_MIN),
+        std::min(100, static_cast<int>(doc["map_brightness"] |
+                                       static_cast<int>(MAP_BRIGHTNESS_DEFAULT)))
+    ));
+    if (!rangeIsLocal) {
+        rangeIndex = std::min<size_t>(doc["range_index"] | 1, RANGE_COUNT - 1);
+    }
+    unlockState();
+    selectConfiguredAirports();
+}
+
+// Keeps the last good site config so a display still comes up correctly when the
+// Pi is down -- otherwise every reboot during an outage would fall back to the
+// compiled-in position.
+static void cacheSiteConfig(const String &json) {
+    if (json.length() == 0 || json.length() > 1024) return;
+    prefs.putString("siteCfg", json);
+}
+
+static bool applyCachedSiteConfig() {
+    String cached = prefs.getString("siteCfg", "");
+    if (cached.length() == 0) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, cached)) return false;
+    applySiteConfig(doc);
+    RADAR_LOGI("[config] using cached site config (%u bytes)\n",
+               static_cast<unsigned>(cached.length()));
+    return true;
+}
+
+static bool fetchSiteConfig() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    String feedHost;
+    lockState();
+    feedHost = config.feedHost;
+    unlockState();
+    if (feedHost.length() == 0) return false;
+
+    String url = "http://";
+    url += feedHost;
+    url += "/config";
+
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, url)) return false;
+    http.setTimeout(5000);
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        RADAR_LOGI("[config] site config fetch failed http=%d\n", code);
+        http.end();
+        return false;
+    }
+    String body = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        RADAR_LOGI("[config] site config parse failed: %s\n", err.c_str());
+        return false;
+    }
+    applySiteConfig(doc);
+    cacheSiteConfig(body);
+    RADAR_LOGI("[config] site config from %s lat=%.5f lon=%.5f known=%d\n",
+               feedHost.c_str(), config.lat, config.lon,
+               static_cast<int>(config.sitePositionKnown));
+    return true;
+}
+
+// Writes a single setting back to the Pi, so a change made on one panel's
+// settings screen survives a reflash and shows up on every other panel.
+static bool pushSiteConfig(const String &patchJson) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    String feedHost;
+    lockState();
+    feedHost = config.feedHost;
+    unlockState();
+    if (feedHost.length() == 0) return false;
+
+    String url = "http://";
+    url += feedHost;
+    url += "/config";
+
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, url)) return false;
+    http.setTimeout(5000);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(patchJson);
+    bool ok = code == HTTP_CODE_OK;
+    if (ok) cacheSiteConfig(http.getString());
+    http.end();
+    if (!ok) RADAR_LOGI("[config] site config push failed http=%d\n", code);
+    return ok;
+}
+
+// Position is deliberately omitted: it belongs to the receiver, and a display
+// must never be able to talk the site into believing it is somewhere else.
+static bool pushCurrentSiteConfig() {
+    JsonDocument doc;
+    lockState();
+    doc["miles"] = config.miles;
+    doc["runways"] = config.showRunways;
+    doc["airport_mode"] = static_cast<int>(config.airportSelectionMode);
+    doc["airport_count"] = config.airportCount;
+    doc["airport_radius_km"] = config.airportRadiusKm;
+    doc["airport_icao"] = config.manualAirportIcao;
+    doc["label_callsign"] = config.showLabelCallsign;
+    doc["label_type"] = config.showLabelType;
+    doc["label_altitude"] = config.showLabelAltitude;
+    doc["label_vsi"] = config.showLabelVerticalRate;
+    doc["symbols"] = static_cast<int>(config.aircraftSymbolStyle);
+    doc["map_brightness"] = config.mapBrightness;
+    unlockState();
+    String out;
+    serializeJson(doc, out);
+    return pushSiteConfig(out);
+}
+
 static bool fetchAdsb() {
     if (WiFi.status() != WL_CONNECTED) {
         setBootStageDetails(BOOT_DATA, "ADSB REQUEST NOT STARTED", "WIFI IS NOT CONNECTED");
@@ -3058,7 +3279,14 @@ static bool toRadarPoint(float lat, float lon, int &x, int &y, float &distKm) {
 static void extrapolatedPosition(const Aircraft &item, uint32_t now, float &lat, float &lon) {
     lat = item.lat;
     lon = item.lon;
+
     if (item.positionMs != 0 && item.gsKnots >= 1.0f) {
+        // Dead reckoning from ground speed and track, deliberately in preference
+        // to interpolating between fixes. Measured on this receiver: replacing
+        // this with a 3 s interpolation buffer raised stalled frames from 1.3%
+        // to 7.1% and p90 apparent speed from 1.02x to 1.28x, because ADS-B
+        // fixes are quantised and irregularly spaced -- interpolating between
+        // them reproduces that noise, while this model does not.
         uint32_t ageMs = now - item.positionMs;
         if (ageMs > AIRCRAFT_EXTRAPOLATE_MAX_MS) {
             ageMs = AIRCRAFT_EXTRAPOLATE_MAX_MS;
@@ -3335,7 +3563,8 @@ static uint8_t planeSizeClass(const Aircraft &item) {
 }
 
 template <typename Gfx>
-static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClass) {
+static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClass,
+                      uint16_t color) {
     int tipLen = 12;
     int tailLen = 8;
     int wingLen = 6;
@@ -3358,11 +3587,15 @@ static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClas
     int tailY = cy + lroundf(c * tailLen);
     int wingX = lroundf(c * wingLen);
     int wingY = lroundf(s * wingLen);
-    g.fillTriangle(tipX, tipY, tailX + wingX, tailY + wingY, tailX - wingX, tailY - wingY, colorPlane);
+    g.fillTriangle(tipX, tipY, tailX + wingX, tailY + wingY, tailX - wingX, tailY - wingY, color);
 }
 
 template <typename Gfx>
-static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
+static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy, bool stale) {
+    // A held position is not a position. Dimming is the whole signal that the
+    // symbol is the last known spot rather than where the aircraft is now.
+    const uint16_t iconColor = stale ? colorDim : colorWarn;
+    const uint16_t bodyColor = stale ? colorDim : colorPlane;
     if (config.aircraftSymbolStyle == AircraftSymbolStyle::DetailedIcons) {
         AircraftIcons::draw(
             g,
@@ -3371,7 +3604,7 @@ static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
             item.noseDeg,
             cx,
             cy,
-            colorWarn
+            iconColor
         );
         return;
     }
@@ -3386,20 +3619,27 @@ static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
         g.drawWideLine(
             cx - rotor1X, cy - rotor1Y,
             cx + rotor1X, cy + rotor1Y,
-            2.0f, colorPlane
+            2.0f, bodyColor
         );
         g.drawWideLine(
             cx - rotor2X, cy - rotor2Y,
             cx + rotor2X, cy + rotor2Y,
-            2.0f, colorPlane
+            2.0f, bodyColor
         );
 
         int tailX = cx - lroundf(s * 7);
         int tailY = cy + lroundf(c * 7);
-        g.drawWideLine(cx, cy, tailX, tailY, 2.0f, colorPlane);
+        g.drawWideLine(cx, cy, tailX, tailY, 2.0f, bodyColor);
         return;
     }
-    drawPlane(g, cx, cy, item.noseDeg, planeSizeClass(item));
+    drawPlane(g, cx, cy, item.noseDeg, planeSizeClass(item), bodyColor);
+}
+
+// True once the newest fix is old enough that what is drawn is a held position
+// rather than a current one.
+static bool aircraftPositionStale(const Aircraft &item, uint32_t now) {
+    if (item.positionMs == 0) return false;
+    return (now - item.positionMs) > AIRCRAFT_STALE_MS;
 }
 
 static uint32_t aircraftLabelId(const Aircraft &item) {
@@ -3619,6 +3859,17 @@ static void drawAircraftList(
     snprintf(rangeTitle, sizeof(rangeTitle), "RANGE %s", rangeLabel());
     g.drawString(rangeTitle, PANEL_RIGHT, 10);
 
+    // An unconfigured board used to draw the compiled-in position with nothing
+    // to distinguish it from a real one -- which is exactly how a display ends
+    // up showing a sky nobody is standing under. Say it outright instead.
+    if (!config.sitePositionKnown) {
+        g.setTextSize(1);
+        g.setTextColor(colorWarn, colorBg);
+        g.drawString("NO SITE POSITION", PANEL_RIGHT, 34);
+        g.setTextSize(2);
+        g.setTextColor(colorDim, colorBg);
+    }
+
     int textWidth = PANEL_RIGHT - PANEL_TEXT_X;
 
     // Give up the bottom of the panel to the detail pane while a selection is
@@ -3669,7 +3920,7 @@ static void drawAircraftList(
             g.fillRect(PANEL_X + 2, rowY - 2, 3, PANEL_ROW_H - 1, colorWarn);
         }
 
-        drawAircraftSymbol(g, item, iconX, iconY);
+        drawAircraftSymbol(g, item, iconX, iconY, aircraftPositionStale(item, millis()));
 
         g.setTextDatum(textdatum_t::top_left);
         g.setTextSize(2);
@@ -3973,7 +4224,8 @@ static void drawRadar() {
             continue;
         }
         if (x < 0 || x >= PANEL_X || y < 0 || y >= SCREEN_H) continue;
-        drawAircraftSymbol(g, renderAircraft[i], x, y);
+        drawAircraftSymbol(g, renderAircraft[i], x, y,
+                           aircraftPositionStale(renderAircraft[i], millis()));
     }
 
     size_t labelCount = prepareRadarLabels(
@@ -4028,6 +4280,15 @@ static void drawRadar() {
         &labelMetrics
     );
     uint32_t labelLayoutElapsedUs = micros() - labelLayoutStartedUs;
+#if PLANE_RADAR_DEBUG_UI
+    debugLabelPlacementCount = std::min(labelCount, MAX_AIRCRAFT);
+    for (size_t i = 0; i < debugLabelPlacementCount; i++) {
+        debugLabelPlacements[i].id = labelLayoutInputs[i].id;
+        debugLabelPlacements[i].x = labelLayoutOutputs[i].x;
+        debugLabelPlacements[i].y = labelLayoutOutputs[i].y;
+        debugLabelPlacements[i].visible = labelLayoutOutputs[i].visible;
+    }
+#endif
 
     g.setTextSize(1);
     g.setTextDatum(textdatum_t::top_left);
@@ -4377,6 +4638,13 @@ static void settingRowActivate(SettingRowId id, int delta) {
         break;
     }
     networkDataDirty = true;
+    // Range and the connectivity rows belong to this panel alone; everything
+    // else describes the site and is pushed back to the Pi so it outlives this
+    // board and reaches any other display.
+    if (id != SettingRowId::Range && id != SettingRowId::FeedSource &&
+        id != SettingRowId::WebPortal) {
+        siteConfigDirty = true;
+    }
     unlockState();
 
     if (airportsChanged) {
@@ -4677,12 +4945,20 @@ static void networkTaskMain(void *) {
         serviceWifiReconnect(now);
         if (WiFi.status() == WL_CONNECTED) {
             bool fetchNow = false;
+            bool pushConfig = false;
             lockState();
             if (forceAdsbFetch) {
                 forceAdsbFetch = false;
                 fetchNow = true;
             }
+            if (siteConfigDirty) {
+                siteConfigDirty = false;
+                pushConfig = true;
+            }
             unlockState();
+            if (pushConfig) {
+                pushCurrentSiteConfig();
+            }
             if (fetchNow || now - lastFetchMs >= ADSB_FETCH_INTERVAL_MS) {
                 fetchAdsb();
                 lastFetchMs = millis();
@@ -4974,6 +5250,11 @@ void setup() {
                 "BACKGROUND NETWORK TASK / CORE 0"
             );
             setBootStage(BOOT_SERVICES, BootStatus::Ok);
+            // Position, airports and label settings all come from the receiver,
+            // so this has to land before anything that depends on where we are.
+            if (!fetchSiteConfig() && !applyCachedSiteConfig()) {
+                RADAR_LOGI("[config] no site config; using compiled-in defaults\n");
+            }
             preloadMapCache();
             BuildDiagnostics::logMemory("map-cache-ready");
             setBootStage(BOOT_DATA, BootStatus::Running);

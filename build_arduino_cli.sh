@@ -26,6 +26,10 @@ DEFAULT_WIFI_SSID="${DEFAULT_WIFI_SSID:-}"
 DEFAULT_WIFI_PASSWORD="${DEFAULT_WIFI_PASSWORD:-}"
 DEFAULT_LAT="${DEFAULT_LAT:-51.507400}"
 DEFAULT_LON="${DEFAULT_LON:--0.127800}"
+# Host:port of the pi-feed instance that owns this site's settings. Baking it in
+# is what makes a board swap cost nothing: the display then needs only Wi-Fi
+# credentials, and fetches its position and everything else from the Pi.
+DEFAULT_FEED_HOST="${DEFAULT_FEED_HOST:-}"
 DEFAULT_MAP_PROVIDER="${DEFAULT_MAP_PROVIDER:-none}"
 DEFAULT_STADIA_API_KEY="${DEFAULT_STADIA_API_KEY:-}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
@@ -97,10 +101,27 @@ esac
 # its own layout. The firmware has no OTA path, which frees profile 9 to use
 # huge_app and hand the whole 3 MB slot to the application.
 PROFILE_FLAGS=""
+USB_OPTS="USBMode=hwcdc,CDCOnBoot=default"
+# The panel library only compiles in the backlight driver its board config
+# names, and a custom board header selects none of them by default -- board init
+# then fails outright with "Disabled or unsupported type". Every profile has to
+# ask for the driver its hardware actually uses.
+BACKLIGHT_EXPANDER=" -DESP_PANEL_DRIVERS_BACKLIGHT_USE_SWITCH_EXPANDER=1"
 case "$DISPLAY_PROFILE" in
   0|7|8)
     FLASH_OPTS="FlashMode=qio,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB"
     UPLOAD_SPEED=921600
+    # Waveshare boards switch the backlight through a CH422G expander.
+    PROFILE_FLAGS="$BACKLIGHT_EXPANDER"
+    ;;
+  5)
+    FLASH_OPTS="FlashMode=qio,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB"
+    UPLOAD_SPEED=921600
+    PROFILE_FLAGS="$BACKLIGHT_EXPANDER"
+    # This board is normally used over its native USB-Serial/JTAG port, so route
+    # Serial there. With CDCOnBoot=default the log goes to the UART0 pins
+    # instead and the port looks silent even though the firmware is running.
+    USB_OPTS="USBMode=hwcdc,CDCOnBoot=cdc"
     ;;
   9)
     # QIO boot-loops on this board: the ROM loader gets one segment in and then
@@ -115,12 +136,12 @@ case "$DISPLAY_PROFILE" in
     PROFILE_FLAGS=" -DESP_PANEL_DRIVERS_BACKLIGHT_USE_PWM_LEDC=1"
     ;;
   *)
-    echo "DISPLAY_PROFILE must be 0 (auto), 7, 8, or 9 (CrowPanel 7.0)." >&2
+    echo "DISPLAY_PROFILE must be 0 (auto), 5 (Touch-LCD-5), 7, 8, or 9 (CrowPanel 7.0)." >&2
     exit 1
     ;;
 esac
 
-FQBN="esp32:esp32:esp32s3:UploadSpeed=$UPLOAD_SPEED,USBMode=hwcdc,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,$FLASH_OPTS,DebugLevel=$CORE_DEBUG_LEVEL,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
+FQBN="esp32:esp32:esp32s3:UploadSpeed=$UPLOAD_SPEED,$USB_OPTS,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,$FLASH_OPTS,DebugLevel=$CORE_DEBUG_LEVEL,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
 
 c_define_string() {
   local value="$1"
@@ -140,6 +161,7 @@ CPP_FLAGS+=" -DDEFAULT_WIFI_SSID=$(c_define_string "$DEFAULT_WIFI_SSID")"
 CPP_FLAGS+=" -DDEFAULT_WIFI_PASSWORD=$(c_define_string "$DEFAULT_WIFI_PASSWORD")"
 CPP_FLAGS+=" -DDEFAULT_LAT=$DEFAULT_LAT"
 CPP_FLAGS+=" -DDEFAULT_LON=$DEFAULT_LON"
+CPP_FLAGS+=" -DDEFAULT_FEED_HOST=$(c_define_string "$DEFAULT_FEED_HOST")"
 CPP_FLAGS+=" -DDEFAULT_MAP_PROVIDER=$DEFAULT_MAP_PROVIDER_CODE"
 CPP_FLAGS+=" -DDEFAULT_STADIA_API_KEY=$(c_define_string "$DEFAULT_STADIA_API_KEY")"
 

@@ -309,7 +309,26 @@ static BoardConfig makeCrowPanelBoardConfig() {
 #endif // PLANE_RADAR_BOARD_CROWPANEL7
 
 static Model detectAndPrepareModel() {
-#if PLANE_RADAR_BOARD_CROWPANEL7
+#if PLANE_RADAR_BOARD_TOUCH_LCD5
+    // Shares the LCD-7's buses, so the standard probe applies; the profile is
+    // compile-time because the panel size cannot be inferred from the GT911.
+    uint16_t lcd5Width = 0;
+    uint16_t lcd5Height = 0;
+    bool lcd5Probe = false;
+    if (beginProbeI2c()) {
+        for (uint8_t attempt = 0; attempt < 3 && !lcd5Probe; attempt++) {
+            lcd5Probe = readGt911Dimensions(0x5D, lcd5Width, lcd5Height) ||
+                        readGt911Dimensions(0x14, lcd5Width, lcd5Height);
+            if (!lcd5Probe) delay(30);
+        }
+        i2c_driver_delete(I2C_NUM_0);
+    }
+    RADAR_LOGI("[display] probe gt911=%d limits=%ux%u selected=Touch-LCD-5\n",
+               lcd5Probe ? 1 : 0,
+               static_cast<unsigned>(lcd5Width),
+               static_cast<unsigned>(lcd5Height));
+    return Model::TouchLcd5;
+#elif PLANE_RADAR_BOARD_CROWPANEL7
     uint16_t crowTouchWidth = 0;
     uint16_t crowTouchHeight = 0;
     bool crowProbeOk = false;
@@ -386,6 +405,54 @@ static Model detectAndPrepareModel() {
 #endif // PLANE_RADAR_BOARD_CROWPANEL7
 }
 
+#if PLANE_RADAR_BOARD_TOUCH_LCD5
+// The LCD-5 "B" panel is 1024x600 on the same board design as the LCD-7: same
+// RGB pins, same GT911 on GPIO 8/9, same CH422G driving LCD and touch reset and
+// the backlight. So unlike the 7B and the CrowPanel this keeps the compile-time
+// defaults wholesale -- including the expander and its post-begin reset
+// sequence -- and overrides only what the different panel needs.
+static BoardConfig makeLcd5BoardConfig() {
+    BoardConfig config = ESP_PANEL_BOARD_DEFAULT_CONFIG;
+    config.name = "Waveshare:ESP32-S3-Touch-LCD-5";
+
+    auto *rgb = std::get_if<BusRGB::Config>(&config.lcd->bus_config);
+    auto *refresh = rgb == nullptr
+        ? nullptr
+        : std::get_if<BusRGB::RefreshPanelPartialConfig>(&rgb->refresh_panel);
+    if (refresh != nullptr) {
+        refresh->pclk_hz = PLANE_RADAR_RGB_LCD5_PCLK_HZ;
+        refresh->h_res = 1024;
+        refresh->v_res = 600;
+        // Waveshare's own timings for this panel.
+        refresh->hsync_pulse_width = 24;
+        refresh->hsync_back_porch = 160;
+        refresh->hsync_front_porch = 160;
+        refresh->vsync_pulse_width = 2;
+        refresh->vsync_back_porch = 23;
+        refresh->vsync_front_porch = 12;
+        refresh->bounce_buffer_size_px = 1024 * PLANE_RADAR_RGB_BOUNCE_LINES;
+        refresh->flags_pclk_active_neg = true;
+    }
+
+    auto *lcdVendor = std::get_if<LCD::VendorPartialConfig>(
+        &config.lcd->device_config.vendor
+    );
+    if (lcdVendor != nullptr) {
+        lcdVendor->hor_res = 1024;
+        lcdVendor->ver_res = 600;
+    }
+
+    auto *touchDevice = std::get_if<Touch::DevicePartialConfig>(
+        &config.touch->device_config.device
+    );
+    if (touchDevice != nullptr) {
+        touchDevice->x_max = 1024;
+        touchDevice->y_max = 600;
+    }
+    return config;
+}
+#endif  // PLANE_RADAR_BOARD_TOUCH_LCD5
+
 static BoardConfig make7BBoardConfig() {
     BoardConfig config = ESP_PANEL_BOARD_DEFAULT_CONFIG;
     config.name = "Waveshare:ESP32-S3-Touch-LCD-7B";
@@ -437,6 +504,9 @@ bool Canvas::begin() {
     _model = detectAndPrepareModel();
 #if PLANE_RADAR_BOARD_CROWPANEL7
     BoardConfig config = makeCrowPanelBoardConfig();
+    board = new Board(config);
+#elif PLANE_RADAR_BOARD_TOUCH_LCD5
+    BoardConfig config = makeLcd5BoardConfig();
     board = new Board(config);
 #else
     if (_model == Model::TouchLcd7B) {
@@ -622,6 +692,7 @@ const uint16_t *Canvas::displayedFrameBuffer() const {
 const char *Canvas::modelName() const {
     switch (_model) {
     case Model::TouchLcd7B: return "ESP32-S3-Touch-LCD-7B";
+    case Model::TouchLcd5:  return "ESP32-S3-Touch-LCD-5";
     case Model::CrowPanel7: return "CrowPanel-7.0-DIS08070H";
     default:                return "ESP32-S3-Touch-LCD-7";
     }
@@ -630,6 +701,7 @@ const char *Canvas::modelName() const {
 uint32_t Canvas::pixelClockHz() const {
     switch (_model) {
     case Model::TouchLcd7B: return PLANE_RADAR_RGB_7B_PCLK_HZ;
+    case Model::TouchLcd5:  return PLANE_RADAR_RGB_LCD5_PCLK_HZ;
     case Model::CrowPanel7: return PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ;
     default:                return PLANE_RADAR_RGB_PCLK_HZ;
     }

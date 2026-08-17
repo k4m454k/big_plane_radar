@@ -46,22 +46,36 @@
 #define PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ (21 * 1000 * 1000)
 #endif
 
-// 0: auto, 7: ESP32-S3-Touch-LCD-7, 8: ESP32-S3-Touch-LCD-7B,
+// 0: auto, 5: ESP32-S3-Touch-LCD-5 (1024x600 "B" panel),
+// 7: ESP32-S3-Touch-LCD-7, 8: ESP32-S3-Touch-LCD-7B,
 // 9: Elecrow CrowPanel 7.0 (DIS08070H). Profile 9 is compile-time only:
 // it cannot participate in autodetection because its I2C bus sits on pins
 // that are RGB data lines on the Waveshare boards.
+//
+// Profile 5 shares the LCD-7's board design exactly -- same RGB pins, same
+// GT911 on GPIO 8/9, same CH422G expander driving reset and backlight -- so it
+// keeps the compile-time defaults and overrides only resolution and timing.
 #ifndef PLANE_RADAR_DISPLAY_PROFILE
 #define PLANE_RADAR_DISPLAY_PROFILE 0
 #endif
 
 #if PLANE_RADAR_DISPLAY_PROFILE != 0 && \
+    PLANE_RADAR_DISPLAY_PROFILE != 5 && \
     PLANE_RADAR_DISPLAY_PROFILE != 7 && \
     PLANE_RADAR_DISPLAY_PROFILE != 8 && \
     PLANE_RADAR_DISPLAY_PROFILE != 9
-#error "PLANE_RADAR_DISPLAY_PROFILE must be 0, 7, 8, or 9"
+#error "PLANE_RADAR_DISPLAY_PROFILE must be 0, 5, 7, 8, or 9"
 #endif
 
 #define PLANE_RADAR_BOARD_CROWPANEL7 (PLANE_RADAR_DISPLAY_PROFILE == 9)
+#define PLANE_RADAR_BOARD_TOUCH_LCD5 (PLANE_RADAR_DISPLAY_PROFILE == 5)
+
+// Waveshare ship this panel at 21 MHz, which with its 1368x637 total works out
+// at only 24 Hz. The 7B profile already drives the same 1024x600 resolution at
+// 30 MHz on the same SoC, so there is proven headroom; 30 MHz here gives 34 Hz.
+#ifndef PLANE_RADAR_RGB_LCD5_PCLK_HZ
+#define PLANE_RADAR_RGB_LCD5_PCLK_HZ (30 * 1000 * 1000)
+#endif
 
 #ifndef PLANE_RADAR_RGB_BOUNCE_LINES
 #define PLANE_RADAR_RGB_BOUNCE_LINES 10
