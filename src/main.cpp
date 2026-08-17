@@ -68,12 +68,20 @@ static constexpr int PANEL_PAD = 10;
 static int PANEL_TEXT_X = 562;
 static int PANEL_RIGHT = 790;
 static constexpr int PANEL_LIST_TOP = 42;
-static constexpr int PANEL_ROW_H = 54;
+// Row and pane heights are runtime values because the 5" panel packs the same
+// 1024x600 into far less glass -- ~237 PPI against the 7" boards' ~133 -- so
+// identical pixel sizes come out roughly half the physical height and stop
+// being readable across a room. See uiDense.
+static int PANEL_ROW_H = 54;
 // Height reserved at the bottom of the side panel for the selected aircraft's
 // details. Claimed only while something is selected, so the list keeps its full
 // height the rest of the time.
-static constexpr int DETAIL_PANE_H = 112;
+static int DETAIL_PANE_H = 112;
 static constexpr size_t PANEL_MAX_ROWS = 12;
+// Set for panels dense enough that the default sizes are too small to read at a
+// distance. Text steps up a size and rows grow to match, trading rows on screen
+// for legibility -- ten rows nobody can read is worse than seven they can.
+static bool uiDense = false;
 static size_t panelVisibleRows = 8;
 static constexpr int AIRCRAFT_LABEL_LINE_ADVANCE = 9;
 static constexpr int AIRCRAFT_LABEL_LINE_HEIGHT = 7;
@@ -151,6 +159,9 @@ static void configureDisplayLayout() {
         ? 680
         : 520;
     PANEL_X = std::min(PANEL_X, SCREEN_W - 240);
+    uiDense = screen.model() == PanelDisplay::Model::TouchLcd5;
+    PANEL_ROW_H = uiDense ? 78 : 54;
+    DETAIL_PANE_H = uiDense ? 150 : 112;
     RADAR_CX = PANEL_X / 2;
     RADAR_CY = SCREEN_H / 2;
     RADAR_RADIUS = std::min(RADAR_CY - 22, RADAR_CX - 42);
@@ -3866,7 +3877,7 @@ static void appendTokenIfFits(
         line[originalLen] = '\0';
     }
     strlcat(line, token, lineLen);
-    if (g.textWidth(line) > maxWidth) {
+    if ((uiDense ? g.mediumTextWidth(line) : g.textWidth(line)) > maxWidth) {
         line[originalLen - separatorLen] = '\0';
     }
 }
@@ -3938,7 +3949,7 @@ static void drawAircraftList(
         const Aircraft &item = items[idx];
         int rowY = PANEL_LIST_TOP + drawn * PANEL_ROW_H;
         int iconX = PANEL_X + 20;
-        int iconY = rowY + 23;
+        int iconY = rowY + (uiDense ? 34 : 23);
         bool selected = selectedHex != nullptr &&
             selectedHex[0] != '\0' &&
             strcmp(item.hex, selectedHex) == 0;
@@ -3957,11 +3968,15 @@ static void drawAircraftList(
         drawAircraftSymbol(g, item, iconX, iconY, aircraftPositionStale(item, millis()));
 
         g.setTextDatum(textdatum_t::top_left);
-        g.setTextSize(2);
+        g.setTextSize(uiDense ? 3 : 2);
         g.setTextColor(colorText, rowBg);
         g.drawString(item.callsign[0] ? item.callsign : "????", PANEL_TEXT_X, rowY);
 
         g.setTextSize(1);
+        // Rows are taller on a dense panel, so the two text lines below the
+        // callsign sit proportionally lower.
+        const int detailY = rowY + (uiDense ? 30 : 20);
+        const int secondaryY = rowY + (uiDense ? 52 : 32);
         char detail[96] = {};
         char distance[16];
         char speed[16];
@@ -3973,20 +3988,32 @@ static void drawAircraftList(
         appendTokenIfFits(g, detail, sizeof(detail), item.vsi, textWidth);
         appendTokenIfFits(g, detail, sizeof(detail), speed, textWidth);
         g.setTextColor(colorDim, rowBg);
-        g.drawString(detail, PANEL_TEXT_X, rowY + 20);
+        if (uiDense) {
+            g.drawMediumString(detail, PANEL_TEXT_X, detailY);
+        } else {
+            g.drawString(detail, PANEL_TEXT_X, detailY);
+        }
 
         const char *squawkAlert = squawkAlertLabel(item.squawk);
         if (squawkAlert != nullptr) {
             char alert[32];
             snprintf(alert, sizeof(alert), "%s %s", item.squawk, squawkAlert);
             g.setTextColor(colorWarn, rowBg);
-            g.drawString(alert, PANEL_TEXT_X, rowY + 32);
+            if (uiDense) {
+                g.drawMediumString(alert, PANEL_TEXT_X, secondaryY);
+            } else {
+                g.drawString(alert, PANEL_TEXT_X, secondaryY);
+            }
         } else {
             char route[(ROUTE_CITY_MAX_LEN * 2) + 8];
             if (routeLabelForCallsign(
                     g, routes, routeCount, item.callsign, textWidth, route, sizeof(route))) {
                 g.setTextColor(colorRunway, rowBg);
-                g.drawString(route, PANEL_TEXT_X, rowY + 32);
+                if (uiDense) {
+                    g.drawMediumString(route, PANEL_TEXT_X, secondaryY);
+                } else {
+                    g.drawString(route, PANEL_TEXT_X, secondaryY);
+                }
             }
         }
 
