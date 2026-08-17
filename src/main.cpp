@@ -1266,6 +1266,11 @@ static void setUnavailableMapBootStatus() {
 // Fetches the map for whichever range is on screen, if no buffer currently
 // holds it. With fewer buffers than ranges, this is what makes the outermost
 // ranges reachable at all: the least recently drawn view gives up its slot.
+// Retry interval for a view that failed to load, so an unreachable receiver is
+// retried steadily rather than on every pass of the network task.
+static constexpr uint32_t MAP_FETCH_RETRY_MS = 20000;
+static uint32_t lastMapFetchAttemptMs = 0;
+
 static bool ensureMapForCurrentRange() {
     if (config.mapProvider == MapProvider::None || !mapRuntimeReady) return false;
     if (config.stadiaApiKey.isEmpty() && !config.useLocalFeed) return false;
@@ -1276,7 +1281,16 @@ static bool ensureMapForCurrentRange() {
     wanted = rangeIndex;
     unlockState();
     if (wanted >= RANGE_COUNT) return false;
-    if (RadarMap::background.hasSlot(wanted)) return false;
+    // Readiness, not slot ownership: a failed fetch leaves the slot claimed but
+    // empty, and testing ownership meant a receiver that was down at boot left
+    // every view permanently blank with nothing ever retrying.
+    if (RadarMap::background.isReady(wanted)) return false;
+    uint32_t nowMs = millis();
+    if (lastMapFetchAttemptMs != 0 &&
+        nowMs - lastMapFetchAttemptMs < MAP_FETCH_RETRY_MS) {
+        return false;
+    }
+    lastMapFetchAttemptMs = nowMs;
 
     RADAR_LOGI("[map] fetching view %u on demand\n", static_cast<unsigned>(wanted));
     bool ok = RadarMap::background.fetchStadia(
@@ -2778,7 +2792,7 @@ static bool routeLabelForCallsign(
             sizeof(destination)
         );
         snprintf(out, outLen, "%s - %s", origin, destination);
-        if (g.textWidth(out) <= maxWidth) {
+        if ((uiDense ? g.mediumTextWidth(out) : g.textWidth(out)) <= maxWidth) {
             return out[0] != '\0';
         }
 
@@ -2786,7 +2800,9 @@ static bool routeLabelForCallsign(
         bool canShortenDestination = canShortenRoutePlace(destinationLen, destinationKeep);
         if (!canShortenOrigin && !canShortenDestination) break;
         if (canShortenOrigin &&
-            (!canShortenDestination || g.textWidth(origin) >= g.textWidth(destination))) {
+            (!canShortenDestination ||
+             (uiDense ? g.mediumTextWidth(origin) : g.textWidth(origin)) >=
+             (uiDense ? g.mediumTextWidth(destination) : g.textWidth(destination)))) {
             shortenRoutePlace(originLen, originKeep);
         } else {
             shortenRoutePlace(destinationLen, destinationKeep);
@@ -4089,10 +4105,21 @@ static int drawSelectedAircraftCard(
     char line[80];
 
     g.setTextDatum(textdatum_t::top_left);
-    g.setTextSize(2);
+    g.setTextSize(uiDense ? 3 : 2);
     g.setTextColor(colorText, colorBg);
     g.drawString(sel->callsign[0] ? sel->callsign : "????", tx, ty);
-    ty += 24;
+    ty += uiDense ? 34 : 24;
+
+    // Body lines match the list rows: the medium face on a dense panel, where
+    // the 5x7 font is about half the physical height it is on the 7" boards.
+    const int lineStep = uiDense ? 18 : 13;
+    auto detailLine = [&](const char *text) {
+        if (uiDense) {
+            g.drawMediumString(text, tx, ty);
+        } else {
+            g.drawString(text, tx, ty);
+        }
+    };
 
     g.setTextSize(1);
     g.setTextColor(colorDim, colorBg);
@@ -4103,8 +4130,8 @@ static int drawSelectedAircraftCard(
         sel->type[0] ? sel->type : "----",
         sel->hex[0] ? sel->hex : "------"
     );
-    g.drawString(line, tx, ty);
-    ty += 14;
+    detailLine(line);
+    ty += lineStep;
 
     g.setTextColor(colorText, colorBg);
     snprintf(
@@ -4114,8 +4141,8 @@ static int drawSelectedAircraftCard(
         sel->alt[0] ? sel->alt : "ALT --",
         sel->vsi
     );
-    g.drawString(line, tx, ty);
-    ty += 13;
+    detailLine(line);
+    ty += lineStep;
 
     char distance[16];
     char speed[16];
@@ -4129,8 +4156,8 @@ static int drawSelectedAircraftCard(
         static_cast<int>(sel->trackDeg + 0.5f) % 360,
         distance
     );
-    g.drawString(line, tx, ty);
-    ty += 13;
+    detailLine(line);
+    ty += lineStep;
 
     if (sel->squawk[0]) {
         const char *alert = squawkAlertLabel(sel->squawk);
@@ -4143,15 +4170,15 @@ static int drawSelectedAircraftCard(
             alert != nullptr ? alert : ""
         );
         g.setTextColor(alert != nullptr ? colorWarn : colorDim, colorBg);
-        g.drawString(line, tx, ty);
+        detailLine(line);
     }
-    ty += 13;
+    ty += lineStep;
 
     char route[(ROUTE_CITY_MAX_LEN * 2) + 8];
     if (routeLabelForCallsign(
             g, routes, routeCount, sel->callsign, maxTextW, route, sizeof(route))) {
         g.setTextColor(colorRunway, colorBg);
-        g.drawString(route, tx, ty);
+        detailLine(route);
     }
     return CARD_H;
 }
