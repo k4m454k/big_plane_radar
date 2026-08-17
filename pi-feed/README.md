@@ -218,12 +218,48 @@ RADAR_FEED_SOURCE=upstream ./radar_feed.py --port 8081
 
 ## 8. Point the radar at it
 
-Open the device's web portal, set **Local ADS-B feed host** to `<pi>:8081`, and
-save. Then on the device: long-press → **ADS-B SOURCE** → `LOCAL`.
+Build the firmware with the Pi's address baked in and the display needs nothing
+but Wi-Fi credentials:
 
-The host and the enable flag are stored separately, so you can switch back to
-`PUBLIC` on-device without retyping the address — useful if the Pi is down or
-you take the display elsewhere.
+```sh
+DEFAULT_FEED_HOST=<pi>:8081 DISPLAY_PROFILE=5 ./build_arduino_cli.sh
+```
+
+Otherwise, open the device's web portal and set **Local ADS-B feed host** to
+`<pi>:8081`. The host and the enable flag are stored separately, so you can
+switch back to `PUBLIC` on-device without retyping the address — useful if the
+Pi is down or you take the display elsewhere.
+
+### The Pi owns the settings
+
+The display stores no position. On boot it fetches `/config`, which reports the
+receiver's own coordinates straight out of readsb's `receiver.json`:
+
+```sh
+curl -s http://localhost:8081/config
+```
+
+```json
+{"lat":38.677024,"lon":-90.506763,"range_index":1,"runways":true,
+ "position_known":true,"position_source":"receiver"}
+```
+
+That is what makes a panel disposable. Reflash it, swap it for a different
+board, or add a second one, and it centres itself with no input — where
+previously an empty NVS meant the display silently fell back to a compiled-in
+position and drew a sky nobody was standing under. When the position is genuinely
+unknown the display says `NO SITE POSITION` on screen rather than guessing.
+
+Settings changed on a panel's settings screen are POSTed back here and persisted
+to `/var/lib/radar-feed/config.json`, so they outlive the board and reach every
+other panel. Position is the exception: a receiver that publishes its own
+location cannot be moved by a display, so one bad request can't relocate the
+site. If readsb has no location set, `POST /config` with `lat`/`lon` (or set
+`RADAR_FEED_LAT`/`RADAR_FEED_LON`) supplies one.
+
+Range is deliberately per-display: two panels on one receiver can sit at
+different zooms, and the Pi's `range_index` is only the default a panel uses
+until someone changes it on that panel.
 
 ## Troubleshooting
 

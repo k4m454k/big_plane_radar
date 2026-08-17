@@ -72,6 +72,38 @@ CACHE_TTL_S = 0.8
 # inside it, or the display freezes the aircraft until the next fix.
 STALE_POSITION_S = 5.0
 
+# Where the site's display settings live. The receiver knows where it is, so the
+# display should never have to be told -- see SiteConfig.
+CONFIG_PATH = os.environ.get("RADAR_FEED_CONFIG", "/var/lib/radar-feed/config.json")
+
+# receiver.json changes only when readsb is reconfigured, so it is read rarely.
+RECEIVER_TTL_S = 60.0
+
+# Mirrors the firmware's own defaults, so a device that has never reached the Pi
+# and a device that has agree on everything except position.
+CONFIG_DEFAULTS = {
+    "lat": None,
+    "lon": None,
+    "range_index": 1,
+    "miles": False,
+    "runways": True,
+    "airport_mode": 0,
+    "airport_count": 4,
+    "airport_radius_km": 60,
+    "airport_icao": "",
+    "label_callsign": True,
+    "label_type": True,
+    "label_altitude": True,
+    "label_vsi": True,
+    "symbols": 0,
+    "map": 0,
+    "map_brightness": 60,
+}
+
+# Only these may be written by a POST. The device cannot, for instance, talk the
+# server into serving a different aircraft source.
+CONFIG_WRITABLE = frozenset(CONFIG_DEFAULTS)
+
 
 def urlopen(url, timeout):
     """Fetch a URL, tolerating hosts with no usable CA bundle.
@@ -135,6 +167,124 @@ class FeedCache:
                 self._error = f"{type(exc).__name__}: {exc}"
             self._at = time.time()
             return self._aircraft, self._error, 0.0
+
+
+def receiver_source(aircraft_source):
+    """The receiver.json that sits alongside a given aircraft.json.
+
+    readsb publishes the receiver's own position there, which is the whole point
+    of this endpoint: the Pi already knows where it is, so no display should ever
+    have to be told. Returns None for the `upstream` testing mode, which has no
+    local receiver to ask.
+    """
+    if aircraft_source == "upstream":
+        return None
+    base, sep, _ = aircraft_source.rpartition("/")
+    return base + sep + "receiver.json" if sep else None
+
+
+class SiteConfig:
+    """Display settings for this receiver, shared by every panel that asks.
+
+    Position defaults to the receiver's own, so a freshly flashed display centres
+    itself with no input. Anything explicitly set -- by environment or by a POST
+    from a display's settings screen -- overlays that and is persisted, so it
+    survives both a restart here and a board swap at the display end.
+    """
+
+    def __init__(self, aircraft_source, path=CONFIG_PATH):
+        self._receiver_source = receiver_source(aircraft_source)
+        self._path = path
+        self._lock = threading.Lock()
+        self._receiver = {}
+        self._receiver_at = 0.0
+        self._stored = self._read_stored()
+
+    def _read_stored(self):
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                stored = json.load(f)
+            return {k: v for k, v in stored.items() if k in CONFIG_WRITABLE}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:  # noqa: BLE001 - a corrupt file must not brick the feed
+            sys.stderr.write("radar-feed: ignoring unreadable %s: %s\n" % (self._path, exc))
+            return {}
+
+    def _receiver_position(self):
+        """readsb's own lat/lon, cached. Returns {} when it publishes none."""
+        if not self._receiver_source:
+            return {}
+        if time.time() - self._receiver_at < RECEIVER_TTL_S:
+            return self._receiver
+        self._receiver_at = time.time()
+        try:
+            if self._receiver_source.startswith(("http://", "https://")):
+                with urlopen(self._receiver_source, timeout=4) as r:
+                    doc = json.loads(r.read().decode("utf-8", "replace"))
+            else:
+                with open(self._receiver_source, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+            lat, lon = doc.get("lat"), doc.get("lon")
+            # readsb omits both unless the receiver location is configured.
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                self._receiver = {"lat": float(lat), "lon": float(lon)}
+            else:
+                self._receiver = {}
+        except Exception:  # noqa: BLE001 - fall back to whatever is stored
+            self._receiver = {}
+        return self._receiver
+
+    def get(self):
+        with self._lock:
+            merged = dict(CONFIG_DEFAULTS)
+            receiver = self._receiver_position()
+            merged.update(receiver)
+            for key, env in (("lat", "RADAR_FEED_LAT"), ("lon", "RADAR_FEED_LON")):
+                raw = os.environ.get(env)
+                if raw:
+                    try:
+                        merged[key] = float(raw)
+                    except ValueError:
+                        pass
+            # A stored position is a manual override for receivers that publish
+            # none. It must not be able to displace a real one: otherwise a
+            # single bad POST silently moves the site and every display draws a
+            # sky nobody is standing under, with nothing on screen to say so.
+            stored = self._stored
+            if receiver:
+                stored = {k: v for k, v in stored.items() if k not in ("lat", "lon")}
+            merged.update(stored)
+            # Tells the display whether the position is real or still unknown, so
+            # it can say so on screen instead of silently drawing the wrong sky.
+            merged["position_known"] = (
+                isinstance(merged.get("lat"), (int, float)) and
+                isinstance(merged.get("lon"), (int, float))
+            )
+            merged["position_source"] = (
+                "receiver" if receiver
+                else "stored" if "lat" in self._stored
+                else "unset"
+            )
+            return merged
+
+    def update(self, patch):
+        """Merge a patch and persist it. Returns the new merged config."""
+        with self._lock:
+            for key, value in patch.items():
+                if key in CONFIG_WRITABLE:
+                    self._stored[key] = value
+            try:
+                d = os.path.dirname(self._path)
+                if d:
+                    os.makedirs(d, exist_ok=True)
+                tmp = self._path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self._stored, f, indent=1, sort_keys=True)
+                os.replace(tmp, self._path)
+            except Exception as exc:  # noqa: BLE001 - keep serving even if read-only
+                sys.stderr.write("radar-feed: could not persist config: %s\n" % exc)
+        return self.get()
 
 
 def distance_km(lat_a, lon_a, lat_b, lon_b):
@@ -220,6 +370,12 @@ class Handler(BaseHTTPRequestHandler):
                 "upstream_reads": self.server.cache._reads,
                 "error": error,
             }, indent=1))
+            return
+
+        # /config -- everything a display needs to know about this site, so the
+        # display itself stores nothing but Wi-Fi credentials.
+        if path == "config":
+            self._send(200, json.dumps(self.server.config.get(), separators=(",", ":")))
             return
 
         # /route/<callsign> -- cached flight route lookup
@@ -313,6 +469,29 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send(404, json.dumps({"ac": [], "error": "not found"}))
 
+    def do_POST(self):  # noqa: N802 - http.server API
+        """Accept settings changes from a display's on-screen settings menu."""
+        path = self.path.split("?", 1)[0].strip("/")
+        if path != "config":
+            self._send(404, json.dumps({"error": "not found"}))
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 8192:
+            self._send(400, json.dumps({"error": "bad content-length"}))
+            return
+        try:
+            patch = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except ValueError as exc:
+            self._send(400, json.dumps({"error": "bad json: %s" % exc}))
+            return
+        if not isinstance(patch, dict):
+            self._send(400, json.dumps({"error": "expected a JSON object"}))
+            return
+        self._send(200, json.dumps(self.server.config.update(patch), separators=(",", ":")))
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -325,16 +504,28 @@ def main():
                     help="max aircraft returned; must not exceed the firmware's MAX_AIRCRAFT")
     ap.add_argument("--stadia-key", default=os.environ.get("RADAR_FEED_STADIA_KEY", ""),
                     help="Stadia Maps key, so the display need not hold one")
+    ap.add_argument("--config", default=CONFIG_PATH,
+                    help="where site display settings are persisted")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     server.cache = FeedCache(args.source)
+    server.config = SiteConfig(args.source, args.config)
     server.limit = args.limit
     server.verbose = args.verbose
     server.stadia_key = args.stadia_key
+    site = server.config.get()
     print("radar-feed: source=%s bind=%s:%d limit=%d" %
           (args.source, args.bind, args.port, args.limit), flush=True)
+    if site["position_known"]:
+        print("radar-feed: site position %.5f,%.5f (%s)" %
+              (site["lat"], site["lon"], site["position_source"]), flush=True)
+    else:
+        # Without this the displays fall back to their compiled-in default and
+        # draw a sky nobody is standing under.
+        print("radar-feed: WARNING no site position; set the receiver location in "
+              "readsb, or RADAR_FEED_LAT/RADAR_FEED_LON, or POST /config", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

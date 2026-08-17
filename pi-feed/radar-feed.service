@@ -18,8 +18,15 @@ ExecStart=/usr/bin/python3 /opt/pi-feed/radar_feed.py
 Restart=always
 RestartSec=5
 
-# No credentials, no writes, no need for anything beyond a socket.
+# No credentials, and no writes outside the two directories below.
 DynamicUser=yes
+# ProtectSystem=strict makes /var read-only, so both of these must be declared
+# or every write fails at runtime: systemd creates them and hands ownership to
+# the dynamic user. CacheDirectory backs the route and tile caches that keep TLS
+# off the display; StateDirectory holds the site config that means a display
+# stores nothing but Wi-Fi credentials.
+CacheDirectory=radar-feed
+StateDirectory=radar-feed
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
