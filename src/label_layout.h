@@ -80,6 +80,10 @@ private:
         uint32_t layoutRevision = 0;
         float x = 0;
         float y = 0;
+        // The step actually taken last frame, so the next one can tell a
+        // reversal from continued travel and damp only the former.
+        float lastMoveX = 0;
+        float lastMoveY = 0;
         float anchorX = 0;
         float anchorY = 0;
         float width = 0;
