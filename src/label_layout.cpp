@@ -41,8 +41,16 @@ static constexpr uint32_t kOrbitGapCompactDelayMs = 1000;
 static constexpr float kOrbitGapReturnPxPerSecond = 8.0f;
 static constexpr size_t kClusterMaxLabels = 8;
 static constexpr size_t kClusterMaxCandidates = 20;
+// A label that keeps re-deciding where to sit wanders across the map even when
+// its aircraft is still. Measured after reversal damping: every remaining jump
+// over 5 px happened while the aircraft beneath had moved under 0.2 px, and the
+// same labels recurred -- one relocated four times in two minutes. Requiring a
+// Waiting longer before reconsidering a placement trades a slower response to
+// genuine crowding for a label that stays where the reader last saw it. Only
+// the retry delay is raised: also requiring the conflict to persist more frames
+// left labels overlapping for longer than the layout tests permit.
 static constexpr uint8_t kClusterTriggerFrames = 3;
-static constexpr uint32_t kClusterRetryMs = 500;
+static constexpr uint32_t kClusterRetryMs = 2500;
 static constexpr size_t kClusterSearchNodeLimit = 12000;
 static constexpr size_t kCollisionSearchesPerFrame = 8;
 static constexpr uint8_t kHideAfterConflictFrames = 6;
