@@ -4944,10 +4944,17 @@ static void handleTouch() {
         // accumulated and spent a whole row at a time so rows never land
         // half-drawn, and the remainder is clamped so dragging past either end
         // does not build up travel that has to be undone.
-        if (touchDownX >= PANEL_X && listTotalRowCount > panelVisibleRows) {
+        // Gate on the rows actually drawn, not on how many would fit with
+        // nothing selected. A detail card claims the bottom of the list, so the
+        // two disagree exactly when a card is open -- and scrolling was then
+        // refused for precisely the rows the card was covering.
+        size_t rowsShown = visibleListRowCount > 0
+            ? visibleListRowCount
+            : panelVisibleRows;
+        if (touchDownX >= PANEL_X && listTotalRowCount > rowsShown) {
             touchScrollAccumPx += static_cast<int>(y) - static_cast<int>(touchLastY);
             int maxScroll = static_cast<int>(listTotalRowCount) -
-                static_cast<int>(panelVisibleRows);
+                static_cast<int>(rowsShown);
             bool moved = false;
             while (touchScrollAccumPx >= PANEL_ROW_H && listScrollOffset > 0) {
                 listScrollOffset--;
