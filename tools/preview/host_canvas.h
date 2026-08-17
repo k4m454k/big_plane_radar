@@ -9,6 +9,8 @@
 
 #include "../../src/panel_font.h"
 
+#include "../../src/panel_font_aa.inc"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -116,9 +118,68 @@ public:
     }
     void drawMediumString(const std::string &t, int x, int y) { drawMediumString(t.c_str(), x, y); }
 
+    // Anti-aliased text, using the generated atlas and the same 4-bit alpha
+    // blend the firmware's blendAlphaMask4 performs.
+    enum class Face { Small, Large };
+
+    int aaTextWidth(const char *t, Face f) const {
+        if (!t) return 0;
+        const auto *G = (f == Face::Large) ? PanelFontAa::kLargeGlyphs
+                                           : PanelFontAa::kSmallGlyphs;
+        int w = 0;
+        for (size_t i = 0; t[i]; i++) {
+            unsigned c = static_cast<unsigned char>(t[i]);
+            if (c < PanelFontAa::kFirstChar || c > PanelFontAa::kLastChar) continue;
+            w += G[c - PanelFontAa::kFirstChar].advance;
+        }
+        return w;
+    }
+
+    void drawAaString(const char *t, int x, int y, Face f, uint16_t color) {
+        if (!t) return;
+        const auto *G = (f == Face::Large) ? PanelFontAa::kLargeGlyphs
+                                           : PanelFontAa::kSmallGlyphs;
+        const uint8_t *B = (f == Face::Large) ? PanelFontAa::kLargeBitmap
+                                              : PanelFontAa::kSmallBitmap;
+        int pen = x;
+        if (_datum == textdatum_t::top_right) pen = x - aaTextWidth(t, f);
+        for (size_t i = 0; t[i]; i++) {
+            unsigned c = static_cast<unsigned char>(t[i]);
+            if (c < PanelFontAa::kFirstChar || c > PanelFontAa::kLastChar) continue;
+            const auto &g = G[c - PanelFontAa::kFirstChar];
+            if (g.width && g.height)
+                blendAlpha4(pen + g.bearingX, y + g.bearingY,
+                            g.width, g.height, B + g.offset, color);
+            pen += g.advance;
+        }
+    }
+
     // Writes a PNG with no external dependency, so the tool stays buildable with
     // nothing but a compiler.
     bool writePng(const char *path) const;
+
+    // Mirrors Canvas::blendAlphaMask4 exactly: 4-bit alpha, two pixels per byte,
+    // high nibble first.
+    void blendAlpha4(int x, int y, int w, int h, const uint8_t *packed, uint16_t color) {
+        int sr = (color >> 11) & 0x1F, sg = (color >> 5) & 0x3F, sb = color & 0x1F;
+        for (int row = 0; row < h; row++) {
+            for (int col = 0; col < w; col++) {
+                size_t idx = static_cast<size_t>(row) * w + col;
+                uint8_t byte = packed[idx >> 1];
+                uint8_t a = (idx & 1) ? (byte & 0x0F) : (byte >> 4);
+                if (!a) continue;
+                int px = x + col, py = y + row;
+                if (px < 0 || py < 0 || px >= _w || py >= _h) continue;
+                uint16_t bgc = _fb[static_cast<size_t>(py) * _w + px];
+                int ia = 15 - a;
+                int r = (sr * a + ((bgc >> 11) & 0x1F) * ia + 7) / 15;
+                int gg = (sg * a + ((bgc >> 5) & 0x3F) * ia + 7) / 15;
+                int b = (sb * a + (bgc & 0x1F) * ia + 7) / 15;
+                _fb[static_cast<size_t>(py) * _w + px] =
+                    static_cast<uint16_t>((r << 11) | (gg << 5) | b);
+            }
+        }
+    }
 
 private:
     void drawChar(char ch, int x, int y) {

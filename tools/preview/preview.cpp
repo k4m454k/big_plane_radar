@@ -222,6 +222,44 @@ static void drawFontCoverage(HostCanvas &g) {
     g.drawString("ALL PRINTABLE ASCII COVERED - THE ONLY QUESTION MARK IS THE REAL ONE", 20, y + 50);
 }
 
+// Same panel content drawn twice: current bitmap font versus the generated
+// anti-aliased atlas, so the difference is judged on real strings at real size
+// rather than a specimen sheet.
+static void drawFontCompare(HostCanvas &g) {
+    using F = HostCanvas::Face;
+    g.fillScreen(colorBg);
+    g.setTextDatum(textdatum_t::top_left);
+    g.setTextSize(2);
+    g.setTextColor(colorText, colorBg);
+    g.drawString("CURRENT 5x7 BITMAP", 24, 14);
+    g.drawAaString("ROBOTO CONDENSED, ANTI-ALIASED", 420, 14, F::Large, colorText);
+    g.drawWideLine(16, 46, SCREEN_W - 16, 46, 1.0f, colorGrid);
+    g.drawWideLine(SCREEN_W / 2, 46, SCREEN_W / 2, SCREEN_H - 16, 1.0f, colorGrid);
+
+    int y = 64;
+    for (const auto &p : kFleet) {
+        char detail[96], sq[48];
+        snprintf(detail, sizeof(detail), "%s %.1fMI %s %.0fKT", p.type, p.distMi, p.alt, p.gs);
+        snprintf(sq, sizeof(sq), "SQUAWK %s  HDG %03d", p.squawk, p.hdg);
+
+        // left: existing bitmap font
+        g.setTextSize(2); g.setTextColor(colorText, colorBg);
+        g.drawString(p.callsign, 24, y);
+        g.setTextSize(1); g.setTextColor(colorDim, colorBg);
+        g.drawString(detail, 24, y + 20);
+        g.setTextColor(colorRunway, colorBg);
+        g.drawString(p.route ? p.route : sq, 24, y + 32);
+
+        // right: anti-aliased atlas
+        int rx = SCREEN_W / 2 + 24;
+        g.drawAaString(p.callsign, rx, y - 4, F::Large, colorText);
+        g.drawAaString(detail, rx, y + 18, F::Small, colorDim);
+        g.drawAaString(p.route ? p.route : sq, rx, y + 32, F::Small, colorRunway);
+        y += 62;
+        if (y > SCREEN_H - 60) break;
+    }
+}
+
 int main(int argc, char **argv) {
     initPalette();
     const char *out = argc > 1 ? argv[1] : "preview.png";
@@ -254,8 +292,10 @@ int main(int argc, char **argv) {
         g.writePng((base + "_settings.png").c_str()); }
     {   HostCanvas g(SCREEN_W, SCREEN_H); drawFontCoverage(g);
         g.writePng((base + "_font.png").c_str()); }
+    {   HostCanvas g(SCREEN_W, SCREEN_H); drawFontCompare(g);
+        g.writePng((base + "_fontcompare.png").c_str()); }
 
-    printf("wrote %s_{panel_selected,panel_list,settings,font}.png\n", base.c_str());
+    printf("wrote %s_{panel_selected,panel_list,settings,font,fontcompare}.png\n", base.c_str());
     return 0;
 }
 
