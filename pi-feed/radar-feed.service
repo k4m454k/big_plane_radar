@@ -14,6 +14,14 @@ Environment=RADAR_FEED_SOURCE=http://127.0.0.1:8080/data/aircraft.json
 Environment=RADAR_FEED_PORT=8081
 # Must not exceed MAX_AIRCRAFT in the firmware.
 Environment=RADAR_FEED_LIMIT=64
+# Optional, and deliberately not in this file: the Stadia Maps key. Tiles are
+# proxied through here so the displays never open a TLS connection, which means
+# this is the only place the key is needed. Without it only already-cached tiles
+# can be served and anything new returns 503, so a display shows a map for the
+# ranges that happen to be cached and nothing for the rest.
+#   printf 'RADAR_FEED_STADIA_KEY=%s\n' "$KEY" | sudo tee /etc/radar-feed.env
+#   sudo chmod 600 /etc/radar-feed.env
+EnvironmentFile=-/etc/radar-feed.env
 ExecStart=/usr/bin/python3 /opt/pi-feed/radar_feed.py
 Restart=always
 RestartSec=5

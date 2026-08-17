@@ -538,6 +538,11 @@ static bool renderAvailableRows(
     return true;
 }
 
+// PSRAM held back from the view cache so tile decoding still has somewhere to
+// work. The largest working strip observed on the 1024x600 panel is 658 KB;
+// this leaves room for that plus the smaller allocations around it.
+static constexpr size_t kDecodeReserveBytes = 1200000;
+
 bool Background::begin(int width, int height, size_t viewCount) {
     if (_mutex == nullptr) {
         _mutex = xSemaphoreCreateMutexStatic(&_mutexStorage);
@@ -560,19 +565,50 @@ bool Background::begin(int width, int height, size_t viewCount) {
 
     size_t bytes = static_cast<size_t>(width) * height * sizeof(uint16_t);
     for (size_t i = 0; i < viewCount; i++) {
+        // Stop before the cache eats the PSRAM the tile decoder needs. Building
+        // each view allocates a working strip -- observed up to 658 KB at this
+        // panel size -- and it is allocated after this, so a cache that fits
+        // exactly leaves nothing to decode into and every view stays blank.
+        // Filling PSRAM here bought five cached views and zero drawn ones.
+        size_t freeSpiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        if (i > 0 && freeSpiram < bytes + kDecodeReserveBytes) {
+            RADAR_LOGE("[map] stopping at %u of %u views: %u bytes free, need "
+                       "%u plus %u reserved for tile decoding\n",
+                       static_cast<unsigned>(i),
+                       static_cast<unsigned>(viewCount),
+                       static_cast<unsigned>(freeSpiram),
+                       static_cast<unsigned>(bytes),
+                       static_cast<unsigned>(kDecodeReserveBytes));
+            viewCount = i;
+            break;
+        }
         _buffers[i] = static_cast<uint16_t *>(heap_caps_malloc(
             bytes,
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
         ));
         if (_buffers[i] == nullptr) {
-            for (size_t allocated = 0; allocated < i; allocated++) {
-                heap_caps_free(_buffers[allocated]);
-                _buffers[allocated] = nullptr;
+            if (i == 0) {
+                RADAR_LOGE("[map] framebuffer allocation failed views=%u bytes=%u\n",
+                           static_cast<unsigned>(viewCount),
+                           static_cast<unsigned>(bytes * viewCount));
+                return false;
             }
-            RADAR_LOGE("[map] framebuffer allocation failed views=%u bytes=%u\n",
+            // Keep what did fit rather than discarding the lot. A larger panel
+            // needs more per view than a smaller one -- 680x600 wants 4.90 MB
+            // for six views against 4.29 MB free, while 520x480 wants 3.00 MB
+            // and fits -- and dropping every view over a shortfall of a few
+            // hundred KB meant the bigger display showed no map at all.
+            //
+            // The dropped views are the outermost ranges, which simply draw
+            // without a background; isReady() already reports per-view state.
+            RADAR_LOGE("[map] only %u of %u views fit (%u bytes each); "
+                       "outermost %u range(s) will draw without a map\n",
+                       static_cast<unsigned>(i),
                        static_cast<unsigned>(viewCount),
-                       static_cast<unsigned>(bytes * viewCount));
-            return false;
+                       static_cast<unsigned>(bytes),
+                       static_cast<unsigned>(viewCount - i));
+            viewCount = i;
+            break;
         }
     }
     _width = width;
