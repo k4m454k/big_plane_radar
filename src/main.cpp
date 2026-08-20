@@ -123,15 +123,28 @@ static constexpr uint32_t AIRCRAFT_POSITION_EASE_MIN_MS = 400;
 // exactly the "flies too fast sometimes" report. A relocation that large
 // means the displayed position was fiction; gliding it across the scope
 // misrepresents the track, so an instant jump is the honest rendering.
-static constexpr uint32_t AIRCRAFT_POSITION_EASE_MAX_MS = 8000;
-static constexpr float AIRCRAFT_EASE_SPEED_FACTOR = 1.5f;
+static constexpr uint32_t AIRCRAFT_POSITION_EASE_MAX_MS = 20000;
+// Mean correction speed as a fraction of real ground speed. The smoothstep
+// blend peaks at 1.5x this at its midpoint, so the apparent peak is
+// 1 + 1.5*factor: 0.4 gives ~1.6x. The old 1.5 meant measured glide peaks of
+// 2.8-4.2x real speed, which reads exactly as aircraft jumping around.
+static constexpr float AIRCRAFT_EASE_SPEED_FACTOR = 0.4f;
 // Aircraft at the edge of reception drop out of the feed and return a few
 // seconds later. Without somewhere to ease from they snap to the new position,
 // which looks identical to a rendering fault. Remember where each was last
 // drawn for this long so a brief dropout is smoothed; past it the gap is real
 // and snapping is honest, since the intervening track is genuinely unknown.
 static constexpr uint32_t AIRCRAFT_REAPPEAR_EASE_MS = 10000;
-static constexpr uint32_t AIRCRAFT_STALE_MS = 20000;
+static constexpr uint32_t AIRCRAFT_STALE_MS = 6000;
+// Past this, a drawn position is too wrong to keep drawing. Sized to where
+// glide-ability ends: a correction can only be eased when it amounts to
+// roughly 8 s of travel, so an aircraft held visible past that must snap on
+// reacquisition -- visibly. Hiding at 9 s instead means every snap happens
+// while invisible, and reacquisition reads as returning rather than
+// teleporting. Just above normal worst-case staleness (5 s feed filter +
+// 5 s poll), so healthy aircraft never blink. The list row survives the
+// whole 60 s carry, so the list itself stays stable.
+static constexpr uint32_t AIRCRAFT_HIDDEN_MS = 9000;
 static constexpr uint32_t ROUTE_LOOKUP_INTERVAL_MS = 5000;
 static constexpr uint32_t ROUTE_LOOKUP_RETRY_MS = 600000;
 static constexpr uint32_t ROUTE_CACHE_STALE_MS = 60000;
@@ -3807,6 +3820,11 @@ static bool aircraftPositionStale(const Aircraft &item, uint32_t now) {
     return (now - item.positionMs) > AIRCRAFT_STALE_MS;
 }
 
+static bool aircraftPositionHidden(const Aircraft &item, uint32_t now) {
+    if (item.positionMs == 0) return false;
+    return (now - item.positionMs) > AIRCRAFT_HIDDEN_MS;
+}
+
 static uint32_t aircraftLabelId(const Aircraft &item) {
     uint32_t hash = 2166136261U;
     const char *value = item.hex[0] != '\0' ? item.hex : item.callsign;
@@ -3912,6 +3930,9 @@ static size_t prepareRadarLabels(
             static_cast<int>(label.lineCount - 1) * AIRCRAFT_LABEL_LINE_ADVANCE +
             AIRCRAFT_LABEL_PADDING * 2;
 
+        // A hidden aircraft keeps its row but loses its symbol; its label
+        // must follow the symbol, not point at empty scope.
+        if (aircraftPositionHidden(item, millis())) continue;
         RadarLabels::LabelLayoutInput &input = labelLayoutInputs[labelCount];
         input = RadarLabels::LabelLayoutInput();
         input.id = aircraftLabelId(item);
@@ -4400,6 +4421,7 @@ static void drawRadar() {
             continue;
         }
         if (x < 0 || x >= PANEL_X || y < 0 || y >= SCREEN_H) continue;
+        if (aircraftPositionHidden(renderAircraft[i], millis())) continue;
         drawAircraftSymbol(g, renderAircraft[i], x, y,
                            aircraftPositionStale(renderAircraft[i], millis()));
     }
