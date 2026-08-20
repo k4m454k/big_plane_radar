@@ -67,6 +67,18 @@ public:
     void drawMediumString(const String &text, int x, int y);
     void drawMediumString(const char *text, int x, int y);
 
+    // Anti-aliased text from the generated atlas, drawn through the same
+    // 4-bit alpha blend the rotated aircraft icons use. Datum-aware like
+    // drawString: top_left, top_right and middle_center place the AA baseline.
+    enum class AaFace : uint8_t { Small, Large };
+    int aaTextWidth(const char *text, AaFace face) const;
+    int aaTextWidth(const String &text, AaFace face) const;
+    void drawAaString(const char *text, int x, int y, AaFace face, uint16_t color);
+    void drawAaString(const String &text, int x, int y, AaFace face, uint16_t color);
+    // RGB565 has no alpha, so a card is a solid block; the radius is what keeps
+    // it from reading as a spreadsheet row.
+    void fillRoundRect(int x, int y, int w, int h, int r, uint16_t color);
+
     int width() const { return _width; }
     int height() const { return _height; }
     // Pre-clamp controller values, for diagnosing coordinate scaling.

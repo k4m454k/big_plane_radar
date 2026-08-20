@@ -83,9 +83,11 @@ static constexpr size_t PANEL_MAX_ROWS = 12;
 // for legibility -- ten rows nobody can read is worse than seven they can.
 static bool uiDense = false;
 static size_t panelVisibleRows = 8;
-static constexpr int AIRCRAFT_LABEL_LINE_ADVANCE = 9;
-static constexpr int AIRCRAFT_LABEL_LINE_HEIGHT = 7;
-static constexpr int AIRCRAFT_LABEL_PADDING = 1;
+// Sized for the anti-aliased Small face (13 px em, 18 px line) rather than the
+// old 5x7 bitmap the constants were originally tuned against.
+static constexpr int AIRCRAFT_LABEL_LINE_ADVANCE = 20;
+static constexpr int AIRCRAFT_LABEL_LINE_HEIGHT = 18;
+static constexpr int AIRCRAFT_LABEL_PADDING = 2;
 static constexpr uint8_t MAP_BRIGHTNESS_MIN = 20;
 static constexpr uint8_t MAP_BRIGHTNESS_DEFAULT = 100;
 static constexpr uint8_t AIRPORT_COUNT_DEFAULT = 1;
@@ -143,6 +145,10 @@ static constexpr float KM_PER_NM = 1.852f;
 // previous order stands. Sized well above position dither (hundreds of metres
 // between fixes) and well below what a genuine overtake covers between polls.
 static constexpr float LIST_SWAP_DEADBAND_KM = 1.5f;
+// Card geometry for the list and detail pane.
+static constexpr int LIST_CARD_INSET = 8;
+static constexpr int LIST_CARD_GAP = 5;
+static constexpr int LIST_CARD_R = 6;
 // How long an empty-but-successful feed response is treated as a receiver
 // restart rather than an empty sky, so the list is held instead of blanked.
 static constexpr uint32_t EMPTY_FEED_HOLD_MS = 60000;
@@ -173,8 +179,8 @@ static void configureDisplayLayout() {
         : 520;
     PANEL_X = std::min(PANEL_X, SCREEN_W - 240);
     uiDense = screen.model() == PanelDisplay::Model::TouchLcd5;
-    PANEL_ROW_H = uiDense ? 78 : 54;
-    DETAIL_PANE_H = uiDense ? 150 : 112;
+    PANEL_ROW_H = uiDense ? 80 : 73;   // card height plus the gap
+    DETAIL_PANE_H = uiDense ? 174 : 168;
     RADAR_CX = PANEL_X / 2;
     RADAR_CY = SCREEN_H / 2;
     RADAR_RADIUS = std::min(RADAR_CY - 22, RADAR_CX - 42);
@@ -362,7 +368,7 @@ static bool touchScrolled = false;
 // tapping; free-text fields (Wi-Fi password, Stadia key) stay on the web portal,
 // which remains reachable from a row inside this screen.
 static constexpr int SETTINGS_TOP = 58;
-static constexpr int SETTINGS_ROW_H = 52;
+static constexpr int SETTINGS_ROW_H = 68;
 static bool settingsActive = false;
 static int settingsScrollOffset = 0;
 static bool settingsRedraw = false;
@@ -791,6 +797,10 @@ static uint16_t colorPlane;
 static uint16_t colorRunway;
 static uint16_t colorWarn;
 static uint16_t colorTrackDim;
+static uint16_t colorCard;
+static uint16_t colorCardSelected;
+static uint16_t colorStroke;
+static uint16_t colorAccent;
 static uint16_t colorTrackBright;
 static uint16_t colorTrackForecast;
 static uint16_t colorSelectedRow;
@@ -2805,7 +2815,7 @@ static bool routeLabelForCallsign(
             sizeof(destination)
         );
         snprintf(out, outLen, "%s - %s", origin, destination);
-        if ((uiDense ? g.mediumTextWidth(out) : g.textWidth(out)) <= maxWidth) {
+        if (g.aaTextWidth(out, PanelDisplay::Canvas::AaFace::Small) <= maxWidth) {
             return out[0] != '\0';
         }
 
@@ -2814,8 +2824,8 @@ static bool routeLabelForCallsign(
         if (!canShortenOrigin && !canShortenDestination) break;
         if (canShortenOrigin &&
             (!canShortenDestination ||
-             (uiDense ? g.mediumTextWidth(origin) : g.textWidth(origin)) >=
-             (uiDense ? g.mediumTextWidth(destination) : g.textWidth(destination)))) {
+             g.aaTextWidth(origin, PanelDisplay::Canvas::AaFace::Small) >=
+             g.aaTextWidth(destination, PanelDisplay::Canvas::AaFace::Small))) {
             shortenRoutePlace(originLen, originKeep);
         } else {
             shortenRoutePlace(destinationLen, destinationKeep);
@@ -3864,7 +3874,7 @@ static size_t prepareRadarLabels(
             RadarLabelLine &line = label.lines[label.lineCount++];
             strlcpy(line.text, text, sizeof(line.text));
             line.color = color;
-            line.width = g.textWidth(line.text);
+            line.width = g.aaTextWidth(line.text, PanelDisplay::Canvas::AaFace::Small);
             label.width = std::max(label.width, line.width);
         };
 
@@ -3975,7 +3985,7 @@ static void appendTokenIfFits(
         line[originalLen] = '\0';
     }
     strlcat(line, token, lineLen);
-    if ((uiDense ? g.mediumTextWidth(line) : g.textWidth(line)) > maxWidth) {
+    if (g.aaTextWidth(line, PanelDisplay::Canvas::AaFace::Small) > maxWidth) {
         line[originalLen - separatorLen] = '\0';
     }
 }
@@ -3991,29 +4001,38 @@ static void drawAircraftList(
     const char *selectedHex
 ) {
     g.fillRect(PANEL_X, 0, SCREEN_W - PANEL_X, SCREEN_H, colorBg);
-    g.drawWideLine(PANEL_X - 8, 18, PANEL_X - 8, SCREEN_H - 18, 1.0f, colorGrid);
     visibleListRowCount = 0;
     memset(visibleListAircraftHex, 0, sizeof(visibleListAircraftHex));
 
-    g.setTextDatum(textdatum_t::top_right);
-    g.setTextSize(2);
-    g.setTextColor(colorDim, colorBg);
-    char rangeTitle[24];
-    snprintf(rangeTitle, sizeof(rangeTitle), "RANGE %s", rangeLabel());
-    g.drawString(rangeTitle, PANEL_RIGHT, 10);
+    // Range as a chip rather than floating caps text: it is a control -- tap
+    // the radar to cycle it -- and controls should look tappable. The count
+    // sits beside it so the two read as one header line.
+    using AaFace = PanelDisplay::Canvas::AaFace;
+    {
+        const char *rangeText = rangeLabel();
+        int tw = g.aaTextWidth(rangeText, AaFace::Small);
+        int chipW = tw + 24, chipH = 26;
+        int chipX = PANEL_RIGHT - chipW, chipY = 10;
+        g.fillRoundRect(chipX, chipY, chipW, chipH, 8, colorCard);
+        g.drawAaString(rangeText, chipX + 12, chipY + 4, AaFace::Small, colorText);
+        char countText[20];
+        snprintf(countText, sizeof(countText), "%u TRACKING",
+                 static_cast<unsigned>(itemCount));
+        g.drawAaString(countText, chipX - 14 - g.aaTextWidth(countText, AaFace::Small),
+                       chipY + 4, AaFace::Small, colorDim);
+    }
 
     // An unconfigured board used to draw the compiled-in position with nothing
     // to distinguish it from a real one -- which is exactly how a display ends
     // up showing a sky nobody is standing under. Say it outright instead.
     if (!config.sitePositionKnown) {
+        g.setTextDatum(textdatum_t::top_right);
         g.setTextSize(1);
         g.setTextColor(colorWarn, colorBg);
-        g.drawString("NO SITE POSITION", PANEL_RIGHT, 34);
-        g.setTextSize(2);
-        g.setTextColor(colorDim, colorBg);
+        g.drawString("NO SITE POSITION", PANEL_RIGHT, 44);
     }
 
-    int textWidth = PANEL_RIGHT - PANEL_TEXT_X;
+    int textWidth = PANEL_RIGHT - (PANEL_X + LIST_CARD_INSET + 60);
 
     // Give up the bottom of the panel to the detail pane while a selection is
     // live, but only if that aircraft is actually still being reported.
@@ -4045,36 +4064,37 @@ static void drawAircraftList(
     for (int idx = static_cast<int>(itemCount) - 1 - listScrollOffset;
          idx >= 0 && drawn < maxRows; idx--) {
         const Aircraft &item = items[idx];
+        // Cards on a small gap: the list reads as distinct objects rather
+        // than a ruled table, which is most of what makes a panel feel
+        // current. Row pitch includes the gap.
+        using AaFace = PanelDisplay::Canvas::AaFace;
         int rowY = PANEL_LIST_TOP + drawn * PANEL_ROW_H;
-        int iconX = PANEL_X + 20;
-        int iconY = rowY + (uiDense ? 34 : 23);
+        int cardX = PANEL_X + LIST_CARD_INSET;
+        int cardW = SCREEN_W - PANEL_X - 2 * LIST_CARD_INSET;
+        int cardH = PANEL_ROW_H - LIST_CARD_GAP;
         bool selected = selectedHex != nullptr &&
             selectedHex[0] != '\0' &&
             strcmp(item.hex, selectedHex) == 0;
-        uint16_t rowBg = selected ? colorSelectedRow : colorBg;
+        g.fillRoundRect(cardX, rowY, cardW, cardH, LIST_CARD_R,
+                        selected ? colorCardSelected : colorCard);
         if (selected) {
-            g.fillRect(
-                PANEL_X + 1,
-                rowY - 2,
-                SCREEN_W - PANEL_X - 2,
-                PANEL_ROW_H - 1,
-                rowBg
-            );
-            g.fillRect(PANEL_X + 2, rowY - 2, 3, PANEL_ROW_H - 1, colorWarn);
+            // Accent, never amber: amber is for alerts, this is a selection.
+            g.fillRect(cardX + 6, rowY + 8, 3, cardH - 16, colorAccent);
         }
 
+        // Heading in a dark disc: the old bare symbol floated on the
+        // background and vanished between rows. Dense and standard rows now
+        // share the same faces; density only changes the pitch.
+        int iconX = cardX + 32;
+        int iconY = rowY + cardH / 2;
+        g.fillCircle(iconX, iconY, 17, colorBg);
         drawAircraftSymbol(g, item, iconX, iconY, aircraftPositionStale(item, millis()));
 
-        g.setTextDatum(textdatum_t::top_left);
-        g.setTextSize(uiDense ? 3 : 2);
-        g.setTextColor(colorText, rowBg);
-        g.drawString(item.callsign[0] ? item.callsign : "????", PANEL_TEXT_X, rowY);
-
-        g.setTextSize(1);
-        // Rows are taller on a dense panel, so the two text lines below the
-        // callsign sit proportionally lower.
-        const int detailY = rowY + (uiDense ? 30 : 20);
-        const int secondaryY = rowY + (uiDense ? 52 : 32);
+        const int textX = cardX + 60;
+        const int detailY = rowY + 32;
+        const int secondaryY = rowY + 48;
+        g.drawAaString(item.callsign[0] ? item.callsign : "????",
+                       textX, rowY + 7, AaFace::Large, colorText);
         char detail[96] = {};
         char distance[16];
         char speed[16];
@@ -4085,37 +4105,21 @@ static void drawAircraftList(
         appendTokenIfFits(g, detail, sizeof(detail), item.alt[0] ? item.alt : "ALT --", textWidth);
         appendTokenIfFits(g, detail, sizeof(detail), item.vsi, textWidth);
         appendTokenIfFits(g, detail, sizeof(detail), speed, textWidth);
-        g.setTextColor(colorDim, rowBg);
-        if (uiDense) {
-            g.drawMediumString(detail, PANEL_TEXT_X, detailY);
-        } else {
-            g.drawString(detail, PANEL_TEXT_X, detailY);
-        }
+        g.drawAaString(detail, textX, detailY, AaFace::Small, colorDim);
 
         const char *squawkAlert = squawkAlertLabel(item.squawk);
         if (squawkAlert != nullptr) {
             char alert[32];
             snprintf(alert, sizeof(alert), "%s %s", item.squawk, squawkAlert);
-            g.setTextColor(colorWarn, rowBg);
-            if (uiDense) {
-                g.drawMediumString(alert, PANEL_TEXT_X, secondaryY);
-            } else {
-                g.drawString(alert, PANEL_TEXT_X, secondaryY);
-            }
+            g.drawAaString(alert, textX, secondaryY, AaFace::Small, colorWarn);
         } else {
             char route[(ROUTE_CITY_MAX_LEN * 2) + 8];
             if (routeLabelForCallsign(
                     g, routes, routeCount, item.callsign, textWidth, route, sizeof(route))) {
-                g.setTextColor(colorRunway, rowBg);
-                if (uiDense) {
-                    g.drawMediumString(route, PANEL_TEXT_X, secondaryY);
-                } else {
-                    g.drawString(route, PANEL_TEXT_X, secondaryY);
-                }
+                g.drawAaString(route, textX, secondaryY, AaFace::Small, colorRunway);
             }
         }
 
-        g.drawWideLine(PANEL_X + PANEL_PAD, rowY + PANEL_ROW_H - 4, PANEL_RIGHT, rowY + PANEL_ROW_H - 4, 1.0f, colorGrid);
         strlcpy(
             visibleListAircraftHex[drawn],
             item.hex,
@@ -4131,12 +4135,12 @@ static void drawAircraftList(
         int trackTop = PANEL_LIST_TOP - 2;
         int trackH = maxRows * PANEL_ROW_H;
         int barX = SCREEN_W - 7;
-        g.fillRect(barX, trackTop, 5, trackH, colorGrid);
+        g.fillRect(barX, trackTop, 5, trackH, colorStroke);
         int thumbH = std::max(24, trackH * maxRows / static_cast<int>(itemCount));
         int span = trackH - thumbH;
         int thumbY = trackTop +
             (maxScroll > 0 ? span * listScrollOffset / maxScroll : 0);
-        g.fillRect(barX, thumbY, 5, thumbH, colorText);
+        g.fillRect(barX, thumbY, 5, thumbH, colorDim);
     }
 
     if (drawn == 0) {
@@ -4171,51 +4175,42 @@ static int drawSelectedAircraftCard(
     }
     if (sel == nullptr) return 0;
 
-    const int CARD_X = PANEL_X + 1;
-    const int CARD_W = SCREEN_W - PANEL_X - 2;
-    const int CARD_H = DETAIL_PANE_H;
-    const int CARD_Y = SCREEN_H - CARD_H;
+    // A rounded card like the rows it belongs with, floating on the panel
+    // background rather than ruled off it.
+    const int CARD_X = PANEL_X + LIST_CARD_INSET;
+    const int CARD_W = SCREEN_W - PANEL_X - 2 * LIST_CARD_INSET;
+    const int CARD_H = DETAIL_PANE_H - LIST_CARD_GAP;
+    const int CARD_Y = SCREEN_H - CARD_H - LIST_CARD_GAP;
 
-    g.fillRect(CARD_X, CARD_Y, CARD_W, CARD_H, colorBg);
-    g.drawWideLine(CARD_X, CARD_Y, CARD_X + CARD_W, CARD_Y, 1.0f, colorGrid);
-    // Same warm marker the selected list row uses, so the two read as one selection.
-    g.fillRect(CARD_X, CARD_Y + 2, 3, CARD_H - 2, colorWarn);
+    g.fillRoundRect(CARD_X, CARD_Y, CARD_W, CARD_H, LIST_CARD_R, colorCard);
+    // Accent bar matching the selected row, so the two read as one selection.
+    g.fillRect(CARD_X + 6, CARD_Y + 10, 3, CARD_H - 20, colorAccent);
 
-    int tx = CARD_X + 12;
-    int ty = CARD_Y + 6;
-    int maxTextW = CARD_W - 24;
+    using AaFace = PanelDisplay::Canvas::AaFace;
+    int tx = CARD_X + 18;
+    int ty = CARD_Y + 10;
+    int maxTextW = CARD_W - 36;
     char line[80];
 
-    g.setTextDatum(textdatum_t::top_left);
-    g.setTextSize(uiDense ? 3 : 2);
-    g.setTextColor(colorText, colorBg);
-    g.drawString(sel->callsign[0] ? sel->callsign : "????", tx, ty);
-    ty += uiDense ? 34 : 24;
+    g.drawAaString(sel->callsign[0] ? sel->callsign : "????", tx, ty, AaFace::Large, colorText);
+    ty += 30;
+    g.drawWideLine(CARD_X + 14, ty, CARD_X + CARD_W - 14, ty, 1.0f, colorStroke);
+    ty += 8;
 
-    // Body lines match the list rows: the medium face on a dense panel, where
-    // the 5x7 font is about half the physical height it is on the 7" boards.
-    const int lineStep = uiDense ? 18 : 13;
-    auto detailLine = [&](const char *text) {
-        if (uiDense) {
-            g.drawMediumString(text, tx, ty);
-        } else {
-            g.drawString(text, tx, ty);
-        }
+    const int lineStep = 20;
+    auto detailLineStrong = [&](const char *text) {
+        g.drawAaString(text, tx, ty, AaFace::Small, colorText);
     };
-
-    g.setTextSize(1);
-    g.setTextColor(colorDim, colorBg);
     snprintf(
         line,
         sizeof(line),
-        "%s  %s",
+        "%s %s",
         sel->type[0] ? sel->type : "----",
         sel->hex[0] ? sel->hex : "------"
     );
-    detailLine(line);
-    ty += lineStep;
-
-    g.setTextColor(colorText, colorBg);
+    g.drawAaString(line,
+                   CARD_X + CARD_W - 14 - g.aaTextWidth(line, AaFace::Small),
+                   CARD_Y + 15, AaFace::Small, colorDim);
     snprintf(
         line,
         sizeof(line),
@@ -4223,7 +4218,7 @@ static int drawSelectedAircraftCard(
         sel->alt[0] ? sel->alt : "ALT --",
         sel->vsi
     );
-    detailLine(line);
+    detailLineStrong(line);
     ty += lineStep;
 
     char distance[16];
@@ -4238,7 +4233,7 @@ static int drawSelectedAircraftCard(
         static_cast<int>(sel->trackDeg + 0.5f) % 360,
         distance
     );
-    detailLine(line);
+    detailLineStrong(line);
     ty += lineStep;
 
     if (sel->squawk[0]) {
@@ -4251,16 +4246,15 @@ static int drawSelectedAircraftCard(
             alert != nullptr ? " " : "",
             alert != nullptr ? alert : ""
         );
-        g.setTextColor(alert != nullptr ? colorWarn : colorDim, colorBg);
-        detailLine(line);
+        g.drawAaString(line, tx, ty, PanelDisplay::Canvas::AaFace::Small,
+                       alert != nullptr ? colorWarn : colorDim);
     }
     ty += lineStep;
 
     char route[(ROUTE_CITY_MAX_LEN * 2) + 8];
     if (routeLabelForCallsign(
             g, routes, routeCount, sel->callsign, maxTextW, route, sizeof(route))) {
-        g.setTextColor(colorRunway, colorBg);
-        detailLine(route);
+        g.drawAaString(route, tx, ty, PanelDisplay::Canvas::AaFace::Small, colorRunway);
     }
     return CARD_H;
 }
@@ -4482,8 +4476,8 @@ static void drawRadar() {
                     AIRCRAFT_LABEL_LINE_HEIGHT + AIRCRAFT_LABEL_PADDING * 2,
                     colorBg
                 );
-                g.setTextColor(line.color, colorBg);
-                g.drawString(line.text, textX, lineY);
+                g.drawAaString(line.text, textX, lineY,
+                               PanelDisplay::Canvas::AaFace::Small, line.color);
             }
         }
     };
@@ -4837,17 +4831,19 @@ static void drawSettingsScreen() {
     int btnW = 68;
     int btnH = 36;
 
+    using AaFace = PanelDisplay::Canvas::AaFace;
+    const int gap = 6;
+    const int rowH = SETTINGS_ROW_H - gap;
+    maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 12) / SETTINGS_ROW_H);
+    maxScroll = std::max(0, total - maxRows);
+    settingsScrollOffset = std::min(std::max(settingsScrollOffset, 0), maxScroll);
+
     g.startWrite();
     g.fillScreen(colorBg);
 
-    g.setTextDatum(textdatum_t::top_left);
-    g.setTextSize(2);
-    g.setTextColor(colorText, colorBg);
-    g.drawString("SETTINGS", 24, 14);
-    g.setTextSize(1);
-    g.setTextColor(colorDim, colorBg);
-    g.drawString("DRAG TO SCROLL / TAP TO CHANGE", 190, 24);
-    g.drawWideLine(16, 48, SCREEN_W - 16, 48, 1.0f, colorGrid);
+    g.drawAaString("Settings", 24, 14, AaFace::Large, colorText);
+    g.drawAaString("DRAG TO SCROLL  TAP TO CHANGE", 210, 20, AaFace::Small, colorDim);
+    g.drawWideLine(16, 48, SCREEN_W - 16, 48, 1.0f, colorStroke);
 
     for (int slot = 0; slot < maxRows; slot++) {
         int index = slot + settingsScrollOffset;
@@ -4856,46 +4852,33 @@ static void drawSettingsScreen() {
         int rowY = SETTINGS_TOP + slot * SETTINGS_ROW_H;
         bool action = settingRowIsAction(id);
 
+        g.fillRoundRect(16, rowY, SCREEN_W - 32, rowH, LIST_CARD_R,
+                        action ? colorCardSelected : colorCard);
         if (action) {
-            g.fillRect(16, rowY, SCREEN_W - 32, SETTINGS_ROW_H - 6, colorSelectedRow);
-            g.fillRect(16, rowY, 3, SETTINGS_ROW_H - 6, colorWarn);
+            g.fillRect(22, rowY + 8, 3, rowH - 16, colorAccent);
         }
 
-        g.setTextDatum(textdatum_t::top_left);
-        g.setTextSize(1);
-        g.setTextColor(action ? colorWarn : colorText, action ? colorSelectedRow : colorBg);
-        g.drawMediumString(settingRowLabel(id), 30, rowY + 14);
+        int labelY = rowY + (rowH - 18) / 2 + 1;
+        g.drawAaString(settingRowLabel(id), 32, labelY, AaFace::Small, colorText);
 
         char value[24];
         settingRowValue(id, value, sizeof(value));
         if (value[0] != '\0') {
-            g.setTextDatum(textdatum_t::top_right);
-            g.setTextColor(colorDim, action ? colorSelectedRow : colorBg);
-            g.drawMediumString(
-                value,
-                settingRowIsStepper(id) ? minusX - 16 : SCREEN_W - 30,
-                rowY + 14
-            );
+            int vw = g.aaTextWidth(value, AaFace::Small);
+            int vx = settingRowIsStepper(id) ? minusX - 14 - vw : SCREEN_W - 46 - vw;
+            g.drawAaString(value, vx, labelY, AaFace::Small,
+                           action ? colorText : colorDim);
         }
 
         if (settingRowIsStepper(id)) {
-            int btnY = rowY + 4;
-            g.fillRect(minusX, btnY, btnW, btnH, colorSelectedRow);
-            g.fillRect(plusX, btnY, btnW, btnH, colorSelectedRow);
-            g.setTextDatum(textdatum_t::top_left);
-            g.setTextColor(colorText, colorSelectedRow);
-            g.drawMediumString("-", minusX + btnW / 2 - 4, btnY + 12);
-            g.drawMediumString("+", plusX + btnW / 2 - 4, btnY + 12);
+            int btnY = rowY + (rowH - btnH) / 2;
+            g.fillRoundRect(minusX, btnY, btnW, btnH, 8, colorCardSelected);
+            g.fillRoundRect(plusX, btnY, btnW, btnH, 8, colorCardSelected);
+            g.drawAaString("-", minusX + btnW / 2 - 3, btnY + (btnH - 18) / 2 + 1,
+                           AaFace::Small, colorAccent);
+            g.drawAaString("+", plusX + btnW / 2 - 4, btnY + (btnH - 18) / 2 + 1,
+                           AaFace::Small, colorAccent);
         }
-
-        g.drawWideLine(
-            24,
-            rowY + SETTINGS_ROW_H - 5,
-            SCREEN_W - 24,
-            rowY + SETTINGS_ROW_H - 5,
-            1.0f,
-            colorGrid
-        );
     }
 
     if (total > maxRows) {
@@ -4982,7 +4965,7 @@ static void handleTouch() {
     if (settingsActive) {
         if (rawDown) {
             touchScrollAccumPx += static_cast<int>(y) - static_cast<int>(touchLastY);
-            int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 10) / SETTINGS_ROW_H);
+            int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 12) / SETTINGS_ROW_H);
             int maxScroll =
                 std::max(0, static_cast<int>(SettingRowId::Count) - maxRows);
             bool moved = false;
@@ -5172,17 +5155,24 @@ static void startNetworkTask() {
 }
 
 static void initPalette() {
-    colorBg = screen.color565(2, 8, 7);
-    colorGrid = screen.color565(8, 46, 33);
-    colorText = screen.color565(235, 255, 238);
-    colorDim = screen.color565(110, 190, 145);
+    // Neutral slate. The old green-tinted base read as a 1980s terminal once
+    // the UI gained cards and anti-aliased type; colour is now reserved for
+    // meaning: accent for selection, amber for alerts, teal for routes.
+    colorBg = screen.color565(13, 16, 22);
+    colorGrid = screen.color565(30, 36, 48);
+    colorText = screen.color565(232, 236, 244);
+    colorDim = screen.color565(148, 156, 172);
     colorPlane = screen.color565(255, 55, 80);
-    colorRunway = screen.color565(66, 210, 210);
-    colorWarn = screen.color565(255, 220, 70);
+    colorRunway = screen.color565(94, 206, 214);
+    colorWarn = screen.color565(255, 199, 95);
     colorTrackDim = screen.color565(84, 78, 30);
     colorTrackBright = screen.color565(210, 176, 42);
     colorTrackForecast = screen.color565(125, 108, 42);
-    colorSelectedRow = screen.color565(5, 28, 19);
+    colorSelectedRow = screen.color565(33, 40, 56);
+    colorCard = screen.color565(24, 28, 38);
+    colorCardSelected = screen.color565(33, 40, 56);
+    colorStroke = screen.color565(38, 44, 58);
+    colorAccent = screen.color565(86, 196, 255);
 }
 
 #if PLANE_RADAR_LOG_LEVEL >= PLANE_RADAR_LOG_LEVEL_DEBUG

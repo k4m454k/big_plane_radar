@@ -46,6 +46,18 @@ public:
             for (int xx = x; xx < x + w; xx++) drawPixel(xx, yy, c);
     }
 
+    // RGB565 has no alpha, so a "card" is a solid lighter block; the radius is
+    // what stops it reading as a spreadsheet row. Matches the firmware helper.
+    void fillRoundRect(int x, int y, int w, int h, int r, uint16_t c) {
+        if (r <= 0 || w <= 2 * r || h <= 2 * r) { fillRect(x, y, w, h, c); return; }
+        fillRect(x + r, y, w - 2 * r, h, c);
+        fillRect(x, y + r, w, h - 2 * r, c);
+        fillCircle(x + r, y + r, r, c);
+        fillCircle(x + w - r - 1, y + r, r, c);
+        fillCircle(x + r, y + h - r - 1, r, c);
+        fillCircle(x + w - r - 1, y + h - r - 1, r, c);
+    }
+
     void drawLine(int x0, int y0, int x1, int y1, uint16_t c) {
         int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0);
         int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;

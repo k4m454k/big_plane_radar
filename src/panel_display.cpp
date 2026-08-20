@@ -1,5 +1,6 @@
 #include "panel_display.h"
 #include "panel_font.h"
+#include "panel_font_aa.inc"
 #include "app_log.h"
 #include "display_tuning.h"
 
@@ -1041,6 +1042,72 @@ void Canvas::drawMediumString(const char *text, int x, int y) {
 
 void Canvas::drawMediumString(const String &text, int x, int y) {
     drawMediumString(text.c_str(), x, y);
+}
+
+int Canvas::aaTextWidth(const char *text, AaFace face) const {
+    if (text == nullptr) return 0;
+    const PanelFontAa::AaGlyph *glyphs = face == AaFace::Large
+        ? PanelFontAa::kLargeGlyphs
+        : PanelFontAa::kSmallGlyphs;
+    int width = 0;
+    for (size_t i = 0; text[i] != '\0'; i++) {
+        unsigned c = static_cast<unsigned char>(text[i]);
+        if (c < PanelFontAa::kFirstChar || c > PanelFontAa::kLastChar) continue;
+        width += glyphs[c - PanelFontAa::kFirstChar].advance;
+    }
+    return width;
+}
+
+int Canvas::aaTextWidth(const String &text, AaFace face) const {
+    return aaTextWidth(text.c_str(), face);
+}
+
+void Canvas::drawAaString(const char *text, int x, int y, AaFace face, uint16_t color) {
+    if (text == nullptr) return;
+    const PanelFontAa::AaGlyph *glyphs = face == AaFace::Large
+        ? PanelFontAa::kLargeGlyphs
+        : PanelFontAa::kSmallGlyphs;
+    const uint8_t *bitmap = face == AaFace::Large
+        ? PanelFontAa::kLargeBitmap
+        : PanelFontAa::kSmallBitmap;
+    // Glyph data is padded to whole bytes, so each hands straight to the blend.
+    int pen = x;
+    if (_datum == textdatum_t::top_right) {
+        pen = x - aaTextWidth(text, face);
+    }
+    for (size_t i = 0; text[i] != '\0'; i++) {
+        unsigned c = static_cast<unsigned char>(text[i]);
+        if (c < PanelFontAa::kFirstChar || c > PanelFontAa::kLastChar) continue;
+        const PanelFontAa::AaGlyph &g = glyphs[c - PanelFontAa::kFirstChar];
+        if (g.width > 0 && g.height > 0) {
+            blendAlphaMask4(
+                pen + g.bearingX,
+                y + g.bearingY,
+                g.width,
+                g.height,
+                bitmap + g.offset,
+                color
+            );
+        }
+        pen += g.advance;
+    }
+}
+
+void Canvas::drawAaString(const String &text, int x, int y, AaFace face, uint16_t color) {
+    drawAaString(text.c_str(), x, y, face, color);
+}
+
+void Canvas::fillRoundRect(int x, int y, int w, int h, int r, uint16_t color) {
+    if (r <= 0 || w <= 2 * r || h <= 2 * r) {
+        fillRect(x, y, w, h, color);
+        return;
+    }
+    fillRect(x + r, y, w - 2 * r, h, color);
+    fillRect(x, y + r, w, h - 2 * r, color);
+    fillCircle(x + r, y + r, r, color);
+    fillCircle(x + w - r - 1, y + r, r, color);
+    fillCircle(x + r, y + h - r - 1, r, color);
+    fillCircle(x + w - r - 1, y + h - r - 1, r, color);
 }
 
 } // namespace PanelDisplay

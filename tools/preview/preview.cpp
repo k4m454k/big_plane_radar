@@ -34,16 +34,32 @@ static constexpr int SETTINGS_ROW_H = 52;
 static constexpr int PANEL_PAD = 10;
 
 static uint16_t colorBg, colorGrid, colorText, colorDim, colorRunway, colorWarn, colorSelectedRow;
+// Restyle additions. The old palette tinted everything green -- a deliberate
+// radar-scope homage that reads as a 1980s terminal once the rest of the UI
+// grows cards and typography. The new base is neutral slate; green survives
+// only where it means something (the scope itself stays as-is for now).
+static uint16_t colorCard, colorCardSelected, colorStroke, colorAccent;
 
 static void initPalette() {
-    colorBg          = HostCanvas::color565(2, 8, 7);
-    colorGrid        = HostCanvas::color565(8, 46, 33);
-    colorText        = HostCanvas::color565(235, 255, 238);
-    colorDim         = HostCanvas::color565(110, 190, 145);
-    colorRunway      = HostCanvas::color565(66, 210, 210);
-    colorWarn        = HostCanvas::color565(255, 220, 70);
-    colorSelectedRow = HostCanvas::color565(5, 28, 19);
+    colorBg          = HostCanvas::color565(13, 16, 22);
+    colorCard        = HostCanvas::color565(24, 28, 38);
+    colorCardSelected= HostCanvas::color565(33, 40, 56);
+    colorStroke      = HostCanvas::color565(38, 44, 58);
+    colorAccent      = HostCanvas::color565(86, 196, 255);
+    colorGrid        = HostCanvas::color565(30, 36, 48);
+    colorText        = HostCanvas::color565(232, 236, 244);
+    colorDim         = HostCanvas::color565(148, 156, 172);
+    colorRunway      = HostCanvas::color565(94, 206, 214);
+    colorWarn        = HostCanvas::color565(255, 199, 95);
+    colorSelectedRow = colorCardSelected;
 }
+
+// Cards replace the divider-lined rows: the list reads as distinct objects
+// rather than a table, which is most of what makes a panel feel current.
+static constexpr int CARD_INSET = 8;
+static constexpr int CARD_GAP = 5;
+static constexpr int CARD_R = 6;
+static constexpr int NEW_ROW_H = 68;
 
 struct Plane {
     const char *callsign, *type, *hex, *alt, *vsi, *squawk, *route;
@@ -63,91 +79,108 @@ static const std::vector<Plane> kFleet = {
 // ---- panel drawing --------------------------------------------------------
 
 static void drawPanelChrome(HostCanvas &g, const char *range) {
+    using F = HostCanvas::Face;
     g.fillRect(PANEL_X, 0, SCREEN_W - PANEL_X, SCREEN_H, colorBg);
-    g.drawWideLine(PANEL_X - 8, 18, PANEL_X - 8, SCREEN_H - 18, 1.0f, colorGrid);
-    g.setTextDatum(textdatum_t::top_right);
-    g.setTextSize(2);
-    g.setTextColor(colorDim, colorBg);
-    char t[32];
-    snprintf(t, sizeof(t), "RANGE %s", range);
-    g.drawString(t, SCREEN_W - 10, 10);
+    // Range as a chip rather than floating caps text: it is a control (tap the
+    // radar to cycle it), and controls should look tappable.
+    char t[24];
+    snprintf(t, sizeof(t), "%s", range);
+    int tw = g.aaTextWidth(t, F::Small);
+    int chipW = tw + 24, chipH = 26, chipX = SCREEN_W - 10 - chipW, chipY = 10;
+    g.fillRoundRect(chipX, chipY, chipW, chipH, 8, colorCard);
+    g.drawAaString(t, chipX + 12, chipY + (chipH - 18) / 2 + 1, F::Small, colorText);
+    // Aircraft count, dim, left of the chip so the two read as one header line.
+    g.drawAaString("6 TRACKING", chipX - 14, chipY + (chipH - 18) / 2 + 1, F::Small, colorDim);
 }
 
 static void drawRow(HostCanvas &g, const Plane &p, int rowY, bool selected) {
-    uint16_t rowBg = selected ? colorSelectedRow : colorBg;
+    using F = HostCanvas::Face;
+    int cardX = PANEL_X + CARD_INSET;
+    int cardW = SCREEN_W - PANEL_X - 2 * CARD_INSET;
+    g.fillRoundRect(cardX, rowY, cardW, NEW_ROW_H, CARD_R,
+                    selected ? colorCardSelected : colorCard);
     if (selected) {
-        g.fillRect(PANEL_X + 1, rowY - 2, SCREEN_W - PANEL_X - 2, PANEL_ROW_H - 1, rowBg);
-        g.fillRect(PANEL_X + 2, rowY - 2, 3, PANEL_ROW_H - 1, colorWarn);
+        // Accent bar rather than amber: amber is for alerts, this is a
+        // selection, and the two must never share a colour.
+        g.fillRect(cardX + 6, rowY + 8, 3, NEW_ROW_H - 16, colorAccent);
     }
-    const int textX = PANEL_X + 42;
-    g.setTextDatum(textdatum_t::top_left);
-    g.setTextSize(2);
-    g.setTextColor(colorText, rowBg);
-    g.drawString(p.callsign, textX, rowY);
+    // Direction at a glance: the aircraft's heading in a dark disc, where the
+    // old UI floated a bare symbol that disappeared against the background.
+    int cx = cardX + 32, cy = rowY + NEW_ROW_H / 2;
+    g.fillCircle(cx, cy, 17, colorBg);
+    float rad = p.hdg * 3.14159265f / 180.0f;
+    float s = sinf(rad), c = cosf(rad);
+    auto rot = [&](float px, float py, int &ox, int &oy) {
+        ox = cx + lroundf(px * s - py * c);
+        oy = cy + lroundf(px * c + py * s);
+    };
+    int x1, y1, x2, y2, x3, y3, x4, y4;
+    rot(0, -10, x1, y1); rot(0, 8, x2, y2);        // fuselage
+    g.drawWideLine(x1, y1, x2, y2, 2.0f, colorText);
+    rot(-8, 2, x3, y3); rot(8, 2, x4, y4);          // wings
+    g.drawWideLine(x3, y3, x4, y4, 2.0f, colorText);
+    rot(-4, 8, x3, y3); rot(0, 5, x4, y4);          // tail
+    g.drawWideLine(x3, y3, x4, y4, 2.0f, colorText);
+    rot(4, 8, x3, y3);
+    g.drawWideLine(x3, y3, x4, y4, 2.0f, colorText);
 
-    g.setTextSize(1);
+    int tx = cardX + 60;
+    g.drawAaString(p.callsign, tx, rowY + 7, F::Large, colorText);
     char detail[96];
-    snprintf(detail, sizeof(detail), "%s %.1fMI %s %s %.0fKT",
-             p.type, p.distMi, p.alt, p.vsi, p.gs);
-    g.setTextColor(colorDim, rowBg);
-    g.drawString(detail, textX, rowY + 20);
-
+    snprintf(detail, sizeof(detail), "%s %.1fMI  %s  %.0fKT",
+             p.type, p.distMi, p.alt, p.gs);
+    g.drawAaString(detail, tx, rowY + 32, F::Small, colorDim);
     if (p.route) {
-        g.setTextColor(colorRunway, rowBg);
-        g.drawString(p.route, textX, rowY + 32);
+        g.drawAaString(p.route, tx, rowY + 48, F::Small, colorRunway);
     }
-    g.drawWideLine(PANEL_X + PANEL_PAD, rowY + PANEL_ROW_H - 4,
-                   SCREEN_W - 10, rowY + PANEL_ROW_H - 4, 1.0f, colorGrid);
 }
 
 static void drawDetailPane(HostCanvas &g, const Plane &p) {
-    const int X = PANEL_X + 1, W = SCREEN_W - PANEL_X - 2;
-    const int Y = SCREEN_H - DETAIL_PANE_H;
-    g.fillRect(X, Y, W, DETAIL_PANE_H, colorBg);
-    g.drawWideLine(X, Y, X + W, Y, 1.0f, colorGrid);
-    g.fillRect(X, Y + 2, 3, DETAIL_PANE_H - 2, colorWarn);
+    using F = HostCanvas::Face;
+    const int X = PANEL_X + CARD_INSET, W = SCREEN_W - PANEL_X - 2 * CARD_INSET;
+    const int H = 150;
+    const int Y = SCREEN_H - H - CARD_INSET;
+    g.fillRoundRect(X, Y, W, H, CARD_R, colorCard);
+    g.fillRect(X + 6, Y + 10, 3, H - 20, colorAccent);
 
-    int tx = X + 12, ty = Y + 6;
+    int tx = X + 18, ty = Y + 10;
     char line[80];
-    g.setTextDatum(textdatum_t::top_left);
-    g.setTextSize(2);
-    g.setTextColor(colorText, colorBg);
-    g.drawString(p.callsign, tx, ty);
-    ty += 24;
+    g.drawAaString(p.callsign, tx, ty, F::Large, colorText);
+    // Type and hex belong to the callsign -- a header line, dimmed, not data.
+    snprintf(line, sizeof(line), "%s %s", p.type, p.hex);
+    g.drawAaString(line, X + W - 14 - g.aaTextWidth(line, F::Small),
+                   ty + 5, F::Small, colorDim);
+    ty += 30;
 
-    g.setTextSize(1);
-    g.setTextColor(colorDim, colorBg);
-    snprintf(line, sizeof(line), "%s  %s", p.type, p.hex);
-    g.drawString(line, tx, ty); ty += 14;
+    g.drawWideLine(X + 14, ty, X + W - 14, ty, 1.0f, colorStroke);
+    ty += 8;
 
-    g.setTextColor(colorText, colorBg);
-    snprintf(line, sizeof(line), "%s  %s", p.alt, p.vsi);
-    g.drawString(line, tx, ty); ty += 13;
-    snprintf(line, sizeof(line), "%.0fKT  HDG %03d  %.1fMI", p.gs, p.hdg, p.distMi);
-    g.drawString(line, tx, ty); ty += 13;
+    snprintf(line, sizeof(line), "%s  VSI %s", p.alt, p.vsi);
+    g.drawAaString(line, tx, ty, F::Small, colorText); ty += 20;
+    snprintf(line, sizeof(line), "%.0fKT   HDG %03d   %.1fMI", p.gs, p.hdg, p.distMi);
+    g.drawAaString(line, tx, ty, F::Small, colorText); ty += 20;
     snprintf(line, sizeof(line), "SQUAWK %s", p.squawk);
-    g.setTextColor(colorDim, colorBg);
-    g.drawString(line, tx, ty); ty += 13;
+    g.drawAaString(line, tx, ty, F::Small, colorDim); ty += 22;
     if (p.route) {
-        g.setTextColor(colorRunway, colorBg);
-        g.drawString(p.route, tx, ty);
+        g.drawAaString(p.route, tx, ty, F::Small, colorRunway);
     }
 }
 
 static void drawScrollbar(HostCanvas &g, int rows, int total, int offset, int top) {
     if (total <= rows) return;
-    int trackH = rows * PANEL_ROW_H;
+    int trackH = rows * (NEW_ROW_H + CARD_GAP) - CARD_GAP;
     int barX = SCREEN_W - 7;
-    g.fillRect(barX, top, 5, trackH, colorGrid);
+    g.fillRect(barX, top, 5, trackH, colorStroke);
     int thumbH = std::max(24, trackH * rows / total);
     int maxScroll = total - rows;
     int thumbY = top + (maxScroll > 0 ? (trackH - thumbH) * offset / maxScroll : 0);
-    g.fillRect(barX, thumbY, 5, thumbH, colorText);
+    g.fillRect(barX, thumbY, 5, thumbH, colorDim);
 }
 
 struct SettingRow { const char *label, *value; bool stepper, action; };
 
 static void drawSettings(HostCanvas &g) {
+    using F = HostCanvas::Face;
     static const SettingRow rows[] = {
         {"DISTANCE UNITS","MILES",false,false},
         {"SHOW RUNWAYS","ON",false,false},
@@ -161,43 +194,38 @@ static void drawSettings(HostCanvas &g) {
         {"SAVE / CLOSE","",false,true},
     };
     g.fillScreen(colorBg);
-    g.setTextDatum(textdatum_t::top_left);
-    g.setTextSize(2);
-    g.setTextColor(colorText, colorBg);
-    g.drawString("SETTINGS", 24, 14);
-    g.setTextSize(1);
-    g.setTextColor(colorDim, colorBg);
-    g.drawString("DRAG TO SCROLL / TAP TO CHANGE", 190, 24);
-    g.drawWideLine(16, 48, SCREEN_W - 16, 48, 1.0f, colorGrid);
+    g.drawAaString("Settings", 24, 14, F::Large, colorText);
+    g.drawAaString("DRAG TO SCROLL  TAP TO CHANGE", 210, 20, F::Small, colorDim);
+    g.drawWideLine(16, 48, SCREEN_W - 16, 48, 1.0f, colorStroke);
 
+    const int rowH = 62, gap = 6;
     const int minusX = SCREEN_W - 236, plusX = SCREEN_W - 142, btnW = 68, btnH = 36;
-    int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 10) / SETTINGS_ROW_H);
+    int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 12) / (rowH + gap));
     for (int i = 0; i < maxRows && i < (int)(sizeof(rows) / sizeof(rows[0])); i++) {
         const SettingRow &r = rows[i];
-        int rowY = SETTINGS_TOP + i * SETTINGS_ROW_H;
+        int rowY = SETTINGS_TOP + i * (rowH + gap);
+        g.fillRoundRect(16, rowY, SCREEN_W - 32, rowH, CARD_R,
+                        r.action ? colorCardSelected : colorCard);
         if (r.action) {
-            g.fillRect(16, rowY, SCREEN_W - 32, SETTINGS_ROW_H - 6, colorSelectedRow);
-            g.fillRect(16, rowY, 3, SETTINGS_ROW_H - 6, colorWarn);
+            g.fillRect(22, rowY + 8, 3, rowH - 16, colorAccent);
         }
-        g.setTextDatum(textdatum_t::top_left);
-        g.setTextColor(r.action ? colorWarn : colorText, r.action ? colorSelectedRow : colorBg);
-        g.drawMediumString(r.label, 30, rowY + 14);
+        int labelY = rowY + (rowH - 18) / 2 + 1;
+        g.drawAaString(r.label, 32, labelY, F::Small, colorText);
         if (r.value && r.value[0]) {
-            g.setTextDatum(textdatum_t::top_right);
-            g.setTextColor(colorDim, r.action ? colorSelectedRow : colorBg);
-            g.drawMediumString(r.value, r.stepper ? minusX - 16 : SCREEN_W - 30, rowY + 14);
+            int vw = g.aaTextWidth(r.value, F::Small);
+            int vx = r.stepper ? minusX - 14 - vw : SCREEN_W - 32 - vw;
+            g.drawAaString(r.value, vx, labelY, F::Small,
+                           r.action ? colorText : colorDim);
         }
         if (r.stepper) {
-            int btnY = rowY + 4;
-            g.fillRect(minusX, btnY, btnW, btnH, colorSelectedRow);
-            g.fillRect(plusX, btnY, btnW, btnH, colorSelectedRow);
-            g.setTextDatum(textdatum_t::top_left);
-            g.setTextColor(colorText, colorSelectedRow);
-            g.drawMediumString("-", minusX + btnW / 2 - 4, btnY + 12);
-            g.drawMediumString("+", plusX + btnW / 2 - 4, btnY + 12);
+            int btnY = rowY + (rowH - btnH) / 2;
+            g.fillRoundRect(minusX, btnY, btnW, btnH, 8, colorCardSelected);
+            g.fillRoundRect(plusX, btnY, btnW, btnH, 8, colorCardSelected);
+            g.drawAaString("-", minusX + btnW / 2 - 3, btnY + (btnH - 18) / 2 + 1,
+                           F::Small, colorAccent);
+            g.drawAaString("+", plusX + btnW / 2 - 4, btnY + (btnH - 18) / 2 + 1,
+                           F::Small, colorAccent);
         }
-        g.drawWideLine(24, rowY + SETTINGS_ROW_H - 5, SCREEN_W - 24,
-                       rowY + SETTINGS_ROW_H - 5, 1.0f, colorGrid);
     }
 }
 
@@ -270,10 +298,10 @@ int main(int argc, char **argv) {
         HostCanvas g(SCREEN_W, SCREEN_H);
         g.fillScreen(HostCanvas::color565(20, 22, 20));
         drawPanelChrome(g, "16MI");
-        int listBottom = SCREEN_H - DETAIL_PANE_H;
-        int maxRows = std::max(1, (listBottom - PANEL_LIST_TOP - 2) / PANEL_ROW_H);
+        int listBottom = SCREEN_H - 150 - 2 * CARD_INSET - CARD_GAP;
+        int maxRows = std::max(1, (listBottom - PANEL_LIST_TOP - CARD_GAP) / (NEW_ROW_H + CARD_GAP));
         for (int i = 0; i < maxRows && i < (int)kFleet.size(); i++)
-            drawRow(g, kFleet[i], PANEL_LIST_TOP + i * PANEL_ROW_H, i == 0);
+            drawRow(g, kFleet[i], PANEL_LIST_TOP + i * (NEW_ROW_H + CARD_GAP), i == 0);
         drawScrollbar(g, maxRows, 12, 2, PANEL_LIST_TOP - 2);
         drawDetailPane(g, kFleet[0]);
         g.writePng((base + "_panel_selected.png").c_str());
@@ -282,9 +310,9 @@ int main(int argc, char **argv) {
         HostCanvas g(SCREEN_W, SCREEN_H);
         g.fillScreen(HostCanvas::color565(20, 22, 20));
         drawPanelChrome(g, "62MI");
-        int maxRows = std::max(1, (SCREEN_H - PANEL_LIST_TOP - 2) / PANEL_ROW_H);
+        int maxRows = std::max(1, (SCREEN_H - PANEL_LIST_TOP - CARD_GAP) / (NEW_ROW_H + CARD_GAP));
         for (int i = 0; i < maxRows && i < (int)kFleet.size(); i++)
-            drawRow(g, kFleet[i], PANEL_LIST_TOP + i * PANEL_ROW_H, false);
+            drawRow(g, kFleet[i], PANEL_LIST_TOP + i * (NEW_ROW_H + CARD_GAP), false);
         drawScrollbar(g, maxRows, 12, 0, PANEL_LIST_TOP - 2);
         g.writePng((base + "_panel_list.png").c_str());
     }
