@@ -85,8 +85,12 @@ static bool uiDense = false;
 static size_t panelVisibleRows = 8;
 // Sized for the anti-aliased Small face (13 px em, 18 px line) rather than the
 // old 5x7 bitmap the constants were originally tuned against.
-static constexpr int AIRCRAFT_LABEL_LINE_ADVANCE = 20;
-static constexpr int AIRCRAFT_LABEL_LINE_HEIGHT = 18;
+// Chip metrics sized to the AA Small face's cap height (the em is 13 px but
+// caps stand ~10), not its full line box -- full-height chips collided so
+// much that the layout solver measurably lost the damping gains: reversals
+// 9.9% -> 32.5% after the restyle landed.
+static constexpr int AIRCRAFT_LABEL_LINE_ADVANCE = 16;
+static constexpr int AIRCRAFT_LABEL_LINE_HEIGHT = 14;
 static constexpr int AIRCRAFT_LABEL_PADDING = 2;
 static constexpr uint8_t MAP_BRIGHTNESS_MIN = 20;
 static constexpr uint8_t MAP_BRIGHTNESS_DEFAULT = 100;

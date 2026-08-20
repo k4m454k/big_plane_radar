@@ -27,7 +27,9 @@ static constexpr float kMovementDeadZonePx = 0.25f;
 // movement a threshold decision that varied with solve order, breaking
 // order-independence. Steps continuing in the same direction are untouched, so
 // settling is as quick as before -- only the reversal is bled off.
-static constexpr float kMovementReversalDamping = 0.25f;
+// 0.15 with the larger anti-aliased labels: they collide harder, and at 0.25
+// the damping no longer held -- measured reversals climbed back to 32.5%.
+static constexpr float kMovementReversalDamping = 0.15f;
 static constexpr float kCourseAvoidDistancePx = 80.0f;
 static constexpr float kCourseConeCosineSquared = 0.58682409f;
 static constexpr float kInverseSqrtTwo = 0.70710678f;
@@ -53,8 +55,8 @@ static constexpr uint8_t kClusterTriggerFrames = 3;
 static constexpr uint32_t kClusterRetryMs = 2500;
 static constexpr size_t kClusterSearchNodeLimit = 12000;
 static constexpr size_t kCollisionSearchesPerFrame = 8;
-static constexpr uint8_t kHideAfterConflictFrames = 6;
-static constexpr uint8_t kShowAfterCleanFrames = 20;
+static constexpr uint8_t kHideAfterConflictFrames = 3;
+static constexpr uint8_t kShowAfterCleanFrames = 45;
 static constexpr float kPi = 3.14159265358979323846f;
 static constexpr float kDegreesToRadians = kPi / 180.0f;
 static constexpr float kOrbitArrivalAngleRad = 1.0f * kDegreesToRadians;
