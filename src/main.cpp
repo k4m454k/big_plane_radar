@@ -116,7 +116,14 @@ static constexpr uint32_t AIRCRAFT_EXTRAPOLATE_MAX_MS = 15000;
 // is therefore sized so the correction is covered at a bounded multiple of the
 // aircraft's actual speed, within these limits.
 static constexpr uint32_t AIRCRAFT_POSITION_EASE_MIN_MS = 400;
-static constexpr uint32_t AIRCRAFT_POSITION_EASE_MAX_MS = 4000;
+// Upper bound on a correction ease. If honouring the speed factor would need
+// longer than this, the correction is not eased at all -- it snaps. Measured
+// on hardware: the old 4 s cap forced a 12 km post-gap correction into 4 s,
+// drawing the aircraft at 17x its real speed for the duration, which is
+// exactly the "flies too fast sometimes" report. A relocation that large
+// means the displayed position was fiction; gliding it across the scope
+// misrepresents the track, so an instant jump is the honest rendering.
+static constexpr uint32_t AIRCRAFT_POSITION_EASE_MAX_MS = 8000;
 static constexpr float AIRCRAFT_EASE_SPEED_FACTOR = 1.5f;
 // Aircraft at the edge of reception drop out of the feed and return a few
 // seconds later. Without somewhere to ease from they snap to the new position,
@@ -3295,11 +3302,16 @@ static bool fetchAdsb() {
                     correctionKm / (speedKmPerMs * AIRCRAFT_EASE_SPEED_FACTOR)
                 );
             }
-            fetchedAircraft[i].easeDurationMs = std::min(
-                AIRCRAFT_POSITION_EASE_MAX_MS,
-                std::max(AIRCRAFT_POSITION_EASE_MIN_MS, needed)
-            );
-            fetchedAircraft[i].hasEase = true;
+            if (needed > AIRCRAFT_POSITION_EASE_MAX_MS) {
+                // Too far to cover at a plausible speed: jump, don't glide.
+                fetchedAircraft[i].hasEase = false;
+            } else {
+                fetchedAircraft[i].easeDurationMs = std::max(
+                    AIRCRAFT_POSITION_EASE_MIN_MS,
+                    needed
+                );
+                fetchedAircraft[i].hasEase = true;
+            }
         }
     }
 
