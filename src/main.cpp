@@ -38,6 +38,9 @@
 #ifndef DEFAULT_STADIA_API_KEY
 #define DEFAULT_STADIA_API_KEY ""
 #endif
+#ifndef DEFAULT_FEED_HOST
+#define DEFAULT_FEED_HOST ""
+#endif
 
 enum class MapProvider : uint8_t {
     None = 0,
@@ -65,12 +68,30 @@ static constexpr int PANEL_PAD = 10;
 static int PANEL_TEXT_X = 562;
 static int PANEL_RIGHT = 790;
 static constexpr int PANEL_LIST_TOP = 42;
-static constexpr int PANEL_ROW_H = 54;
+// Row and pane heights are runtime values because the 5" panel packs the same
+// 1024x600 into far less glass -- ~237 PPI against the 7" boards' ~133 -- so
+// identical pixel sizes come out roughly half the physical height and stop
+// being readable across a room. See uiDense.
+static int PANEL_ROW_H = 54;
+// Height reserved at the bottom of the side panel for the selected aircraft's
+// details. Claimed only while something is selected, so the list keeps its full
+// height the rest of the time.
+static int DETAIL_PANE_H = 112;
 static constexpr size_t PANEL_MAX_ROWS = 12;
+// Set for panels dense enough that the default sizes are too small to read at a
+// distance. Text steps up a size and rows grow to match, trading rows on screen
+// for legibility -- ten rows nobody can read is worse than seven they can.
+static bool uiDense = false;
 static size_t panelVisibleRows = 8;
-static constexpr int AIRCRAFT_LABEL_LINE_ADVANCE = 9;
-static constexpr int AIRCRAFT_LABEL_LINE_HEIGHT = 7;
-static constexpr int AIRCRAFT_LABEL_PADDING = 1;
+// Sized for the anti-aliased Small face (13 px em, 18 px line) rather than the
+// old 5x7 bitmap the constants were originally tuned against.
+// Chip metrics sized to the AA Small face's cap height (the em is 13 px but
+// caps stand ~10), not its full line box -- full-height chips collided so
+// much that the layout solver measurably lost the damping gains: reversals
+// 9.9% -> 32.5% after the restyle landed.
+static constexpr int AIRCRAFT_LABEL_LINE_ADVANCE = 16;
+static constexpr int AIRCRAFT_LABEL_LINE_HEIGHT = 14;
+static constexpr int AIRCRAFT_LABEL_PADDING = 2;
 static constexpr uint8_t MAP_BRIGHTNESS_MIN = 20;
 static constexpr uint8_t MAP_BRIGHTNESS_DEFAULT = 100;
 static constexpr uint8_t AIRPORT_COUNT_DEFAULT = 1;
@@ -82,7 +103,52 @@ static constexpr uint32_t WIFI_CONNECT_ATTEMPT_MS = 15000;
 static constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 12000;
 static constexpr uint32_t ADSB_FETCH_INTERVAL_MS = 5000;
 static constexpr uint32_t RADAR_DRAW_INTERVAL_MS = 0;
-static constexpr uint32_t AIRCRAFT_EXTRAPOLATE_MAX_MS = 30000;
+// Bounds how much fiction dead reckoning may invent, but it must exceed the
+// worst-case age of a fix at draw time or the projected position stops
+// advancing and the aircraft visibly parks until the next poll:
+//
+//   age = position age when fetched (<= the feed's stale filter)
+//       + time since that poll        (<= the poll interval)
+//
+// With a 5 s filter and 5 s polling that is 10 s, so 8 s froze aircraft for part
+// of every cycle -- measured as a dead stop followed by a lurch at up to 20x
+// their real speed. Keep this comfortably above filter + poll interval.
+static constexpr uint32_t AIRCRAFT_EXTRAPOLATE_MAX_MS = 15000;
+// Blending a correction over a fixed window makes apparent speed depend on how
+// wrong the prediction was: measured on hardware, a fixed 600 ms produced peaks
+// of 4-11x an aircraft's real ground speed, which reads as darting. The window
+// is therefore sized so the correction is covered at a bounded multiple of the
+// aircraft's actual speed, within these limits.
+static constexpr uint32_t AIRCRAFT_POSITION_EASE_MIN_MS = 400;
+// Upper bound on a correction ease. If honouring the speed factor would need
+// longer than this, the correction is not eased at all -- it snaps. Measured
+// on hardware: the old 4 s cap forced a 12 km post-gap correction into 4 s,
+// drawing the aircraft at 17x its real speed for the duration, which is
+// exactly the "flies too fast sometimes" report. A relocation that large
+// means the displayed position was fiction; gliding it across the scope
+// misrepresents the track, so an instant jump is the honest rendering.
+static constexpr uint32_t AIRCRAFT_POSITION_EASE_MAX_MS = 20000;
+// Mean correction speed as a fraction of real ground speed. The smoothstep
+// blend peaks at 1.5x this at its midpoint, so the apparent peak is
+// 1 + 1.5*factor: 0.4 gives ~1.6x. The old 1.5 meant measured glide peaks of
+// 2.8-4.2x real speed, which reads exactly as aircraft jumping around.
+static constexpr float AIRCRAFT_EASE_SPEED_FACTOR = 0.4f;
+// Aircraft at the edge of reception drop out of the feed and return a few
+// seconds later. Without somewhere to ease from they snap to the new position,
+// which looks identical to a rendering fault. Remember where each was last
+// drawn for this long so a brief dropout is smoothed; past it the gap is real
+// and snapping is honest, since the intervening track is genuinely unknown.
+static constexpr uint32_t AIRCRAFT_REAPPEAR_EASE_MS = 10000;
+static constexpr uint32_t AIRCRAFT_STALE_MS = 6000;
+// Past this, a drawn position is too wrong to keep drawing. Sized to where
+// glide-ability ends: a correction can only be eased when it amounts to
+// roughly 8 s of travel, so an aircraft held visible past that must snap on
+// reacquisition -- visibly. Hiding at 9 s instead means every snap happens
+// while invisible, and reacquisition reads as returning rather than
+// teleporting. Just above normal worst-case staleness (5 s feed filter +
+// 5 s poll), so healthy aircraft never blink. The list row survives the
+// whole 60 s carry, so the list itself stays stable.
+static constexpr uint32_t AIRCRAFT_HIDDEN_MS = 9000;
 static constexpr uint32_t ROUTE_LOOKUP_INTERVAL_MS = 5000;
 static constexpr uint32_t ROUTE_LOOKUP_RETRY_MS = 600000;
 static constexpr uint32_t ROUTE_CACHE_STALE_MS = 60000;
@@ -99,6 +165,23 @@ static constexpr size_t TRACK_POINTS_PER_AIRCRAFT = 120;
 static constexpr float TRACK_MIN_POINT_DISTANCE_KM = 0.03f;
 static constexpr float TRACK_MAX_PLAUSIBLE_SPEED_KNOTS = 1500.0f;
 static constexpr float KM_PER_NM = 1.852f;
+// Distance gap required before two list rows may swap places. Below it the
+// previous order stands. Sized well above position dither (hundreds of metres
+// between fixes) and well below what a genuine overtake covers between polls.
+static constexpr float LIST_SWAP_DEADBAND_KM = 1.5f;
+// Card geometry for the list and detail pane.
+static constexpr int LIST_CARD_INSET = 8;
+static constexpr int LIST_CARD_GAP = 5;
+static constexpr int LIST_CARD_R = 6;
+// How long an empty-but-successful feed response is treated as a receiver
+// restart rather than an empty sky, so the list is held instead of blanked.
+static constexpr uint32_t EMPTY_FEED_HOLD_MS = 60000;
+// How long an aircraft absent from the feed keeps its row while reception
+// recovers. Above the feed's own 5 s staleness cut but well below the longest
+// measured reception gap, so it smooths the common case without pretending a
+// long-gone aircraft is still there.
+static constexpr uint32_t AIRCRAFT_LIST_HOLD_MS = 60000;
+static uint32_t emptyFetchSinceMs = 0;
 static constexpr float KM_PER_DEG = 111.0f;
 static constexpr size_t MAX_AIRCRAFT = 64;
 static constexpr size_t MAX_ROUTE_CACHE = 40;
@@ -113,10 +196,15 @@ static Preferences prefs;
 static void configureDisplayLayout() {
     SCREEN_W = screen.width();
     SCREEN_H = screen.height();
-    PANEL_X = screen.model() == PanelDisplay::Model::TouchLcd7B
+    // Both 1024x600 boards get the wider split; 800x480 keeps 520.
+    PANEL_X = (screen.model() == PanelDisplay::Model::TouchLcd7B ||
+               screen.model() == PanelDisplay::Model::TouchLcd5)
         ? 680
         : 520;
     PANEL_X = std::min(PANEL_X, SCREEN_W - 240);
+    uiDense = screen.model() == PanelDisplay::Model::TouchLcd5;
+    PANEL_ROW_H = uiDense ? 80 : 73;   // card height plus the gap
+    DETAIL_PANE_H = uiDense ? 174 : 168;
     RADAR_CX = PANEL_X / 2;
     RADAR_CY = SCREEN_H / 2;
     RADAR_RADIUS = std::min(RADAR_CY - 22, RADAR_CX - 42);
@@ -149,7 +237,17 @@ struct AppConfig {
         : MapProvider::None;
     String stadiaApiKey = DEFAULT_STADIA_API_KEY;
     uint8_t mapBrightness = MAP_BRIGHTNESS_DEFAULT;
+    // Optional local ADS-B feed, e.g. a Pi running readsb behind pi-feed. Host
+    // and port only ("192.168.1.20:8080"); the path mirrors the public API so
+    // only the scheme and host differ. Kept separate from the enable flag so
+    // the source can be toggled on-device without retyping the address.
+    String feedHost;
+    bool useLocalFeed = false;
     bool configured = false;
+    // Whether the position came from the receiver rather than the compiled-in
+    // fallback. The display says so on screen instead of quietly drawing the
+    // wrong sky, which is how an unconfigured board silently showed London.
+    bool sitePositionKnown = false;
 };
 
 struct Aircraft {
@@ -172,10 +270,23 @@ struct Aircraft {
     int screenX = 0;
     int screenY = 0;
     uint32_t positionMs = 0;
+    // Where this aircraft was last drawn when a fresh position arrived. New
+    // fetches replace lat/lon outright, so without this the icon teleports from
+    // wherever dead reckoning had reached to wherever the truth is; the render
+    // eases out of it instead.
+    float easeLat = 0;
+    float easeLon = 0;
+    uint32_t easeMs = 0;
+    uint32_t easeDurationMs = 0;
+    bool hasEase = false;
     bool inside = false;
     bool hasFlight = false;
     bool hasTrack = false;
 };
+
+// Declared early: both the fetch path and the debug telemetry route need to ask
+// where an aircraft is currently being drawn.
+static void extrapolatedPosition(const Aircraft &item, uint32_t now, float &lat, float &lon);
 
 struct RadarLabelLine {
     char text[32] = {};
@@ -244,11 +355,88 @@ static TrackPoint renderTrack[TRACK_POINTS_PER_AIRCRAFT];
 static RadarLabels::LabelLayout aircraftLabelLayout;
 static RadarLabels::LabelLayoutInput labelLayoutInputs[MAX_AIRCRAFT];
 static RadarLabels::LabelLayoutOutput labelLayoutOutputs[MAX_AIRCRAFT];
+#if PLANE_RADAR_DEBUG_UI
+// Last solved label placement per drawn label, for measuring whether the
+// force-directed layout actually settles. Written on the render task, read by
+// the debug endpoint; torn reads are acceptable for telemetry.
+struct DebugLabelPlacement {
+    uint32_t id;
+    float x;
+    float y;
+    bool visible;
+};
+static DebugLabelPlacement debugLabelPlacements[MAX_AIRCRAFT];
+static size_t debugLabelPlacementCount = 0;
+#endif
 static RadarLabels::AircraftObstacle labelAircraftObstacles[MAX_AIRCRAFT];
 static RadarLabelRender radarLabels[MAX_AIRCRAFT];
 static char selectedAircraftHex[7] = {};
+
+struct LastDrawnPosition {
+    char hex[7] = {};
+    float lat = 0;
+    float lon = 0;
+    uint32_t ms = 0;
+};
+static LastDrawnPosition lastDrawnCache[MAX_AIRCRAFT];
 static char visibleListAircraftHex[PANEL_MAX_ROWS][7] = {};
 static size_t visibleListRowCount = 0;
+// The panel shows PANEL_MAX_ROWS at most while MAX_AIRCRAFT are tracked, so
+// without an offset everything past the first screenful was unreachable.
+static int listScrollOffset = 0;
+static size_t listTotalRowCount = 0;
+static int touchScrollAccumPx = 0;
+static bool touchScrolled = false;
+
+// On-device settings screen. Covers every setting that can be changed by
+// tapping; free-text fields (Wi-Fi password, Stadia key) stay on the web portal,
+// which remains reachable from a row inside this screen.
+static constexpr int SETTINGS_TOP = 58;
+static constexpr int SETTINGS_ROW_H = 68;
+static bool settingsActive = false;
+static int settingsScrollOffset = 0;
+static bool settingsRedraw = false;
+static bool settingsRestartNeeded = false;
+
+// Opt-in UI debugging: adds /ui/* HTTP routes that drive the on-device UI and
+// report touch state, so screens can be captured and input diagnosed remotely.
+// Off by default -- the routes let anyone on the network operate the display.
+// Enable with -DPLANE_RADAR_DEBUG_UI=1.
+#ifndef PLANE_RADAR_DEBUG_UI
+#define PLANE_RADAR_DEBUG_UI 0
+#endif
+
+#if PLANE_RADAR_DEBUG_UI
+#define DBG_UI(stmt) do { stmt; } while (0)
+static uint16_t dbgTouchX = 0;
+static uint16_t dbgTouchY = 0;
+static uint32_t dbgTapEvents = 0;
+static uint32_t dbgListTapCalls = 0;
+static int32_t dbgLastRow = -1;
+static int32_t dbgLastReject = 0;   // 0 ok, 1 left of panel, 2 above list, 3 row out of range
+#else
+#define DBG_UI(stmt) do { } while (0)
+#endif
+
+enum class SettingRowId : uint8_t {
+    Units,
+    Runways,
+    Symbols,
+    LabelCallsign,
+    LabelType,
+    LabelAltitude,
+    LabelVerticalRate,
+    AirportMode,
+    AirportCount,
+    AirportRadius,
+    MapProvider,
+    MapBrightness,
+    Range,
+    FeedSource,
+    WebPortal,
+    Save,
+    Count
+};
 static size_t aircraftCount = 0;
 static String statusText = "BOOT";
 static String lastFetchText = "NO DATA";
@@ -258,6 +446,10 @@ static bool webServerStarted = false;
 static bool wifiReconnectInProgress = false;
 static bool wifiWasConnected = false;
 static bool forceAdsbFetch = false;
+// Set when a site-wide setting is changed on this panel. The POST itself happens
+// on the network task: doing it inline would block the frame loop on a round
+// trip to the Pi every time a setting is tapped.
+static bool siteConfigDirty = false;
 static bool mapRuntimeReady = false;
 static uint32_t wifiReconnectStartedMs = 0;
 static uint32_t lastReconnectMs = 0;
@@ -547,9 +739,20 @@ static void updateAircraftTracksLocked(
     }
 
     if (selectedAircraftHex[0] != '\0') {
+        // An aircraft can be selected before it has accumulated any track, so
+        // absence of a track is not on its own a reason to drop the selection.
+        // Only let it go once the aircraft has also left the live list.
+        bool stillReported = false;
+        for (size_t i = 0; i < itemCount; i++) {
+            if (strcmp(items[i].hex, selectedAircraftHex) == 0) {
+                stillReported = true;
+                break;
+            }
+        }
         AircraftTrack *selected = findAircraftTrackLocked(selectedAircraftHex);
-        if (selected == nullptr ||
-            now - selected->lastSeenMs > TRACK_SELECTION_MISSING_MS) {
+        bool trackStale = selected == nullptr ||
+            now - selected->lastSeenMs > TRACK_SELECTION_MISSING_MS;
+        if (!stillReported && trackStale) {
             RADAR_LOGD("[track] selection cleared missing=%s\n", selectedAircraftHex);
             selectedAircraftHex[0] = '\0';
         }
@@ -589,14 +792,26 @@ struct RangePreset {
     const char *miLabel;
 };
 
+// outerKm is the map extent to the panel corners; the label is the outer ring
+// radius, so outerKm runs about 1.33x the labelled figure.
+//
+// Each preset costs one cached map view in PSRAM (panel_width * height * 2, so
+// ~499 KB at 520x480) plus its tile downloads at boot, which is why the list is
+// short rather than a continuous zoom.
 static const RangePreset ranges[] = {
     {6.7f, "5km", "3mi"},
     {13.3f, "10km", "6mi"},
     {20.0f, "15km", "9mi"},
     {33.3f, "25km", "16mi"},
+    {66.7f, "50km", "31mi"},
+    {133.3f, "100km", "62mi"},
 };
 static constexpr size_t RANGE_COUNT = sizeof(ranges) / sizeof(ranges[0]);
 static size_t rangeIndex = 1;
+// Set once this panel's range has been chosen on the panel itself. Until then the
+// Pi's range is taken as the default, which is what lets a second display come up
+// sensibly without forcing both panels to share one zoom.
+static bool rangeIsLocal = false;
 
 static uint16_t colorBg;
 static uint16_t colorGrid;
@@ -606,6 +821,10 @@ static uint16_t colorPlane;
 static uint16_t colorRunway;
 static uint16_t colorWarn;
 static uint16_t colorTrackDim;
+static uint16_t colorCard;
+static uint16_t colorCardSelected;
+static uint16_t colorStroke;
+static uint16_t colorAccent;
 static uint16_t colorTrackBright;
 static uint16_t colorTrackForecast;
 static uint16_t colorSelectedRow;
@@ -1091,6 +1310,54 @@ static void setUnavailableMapBootStatus() {
     }
 }
 
+// Fetches the map for whichever range is on screen, if no buffer currently
+// holds it. With fewer buffers than ranges, this is what makes the outermost
+// ranges reachable at all: the least recently drawn view gives up its slot.
+// Retry interval for a view that failed to load, so an unreachable receiver is
+// retried steadily rather than on every pass of the network task.
+static constexpr uint32_t MAP_FETCH_RETRY_MS = 20000;
+static uint32_t lastMapFetchAttemptMs = 0;
+
+static bool ensureMapForCurrentRange() {
+    if (config.mapProvider == MapProvider::None || !mapRuntimeReady) return false;
+    if (config.stadiaApiKey.isEmpty() && !config.useLocalFeed) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    size_t wanted = 0;
+    lockState();
+    wanted = rangeIndex;
+    unlockState();
+    if (wanted >= RANGE_COUNT) return false;
+    // Readiness, not slot ownership: a failed fetch leaves the slot claimed but
+    // empty, and testing ownership meant a receiver that was down at boot left
+    // every view permanently blank with nothing ever retrying.
+    if (RadarMap::background.isReady(wanted)) return false;
+    uint32_t nowMs = millis();
+    if (lastMapFetchAttemptMs != 0 &&
+        nowMs - lastMapFetchAttemptMs < MAP_FETCH_RETRY_MS) {
+        return false;
+    }
+    lastMapFetchAttemptMs = nowMs;
+
+    RADAR_LOGI("[map] fetching view %u on demand\n", static_cast<unsigned>(wanted));
+    bool ok = RadarMap::background.fetchStadia(
+        config.lat,
+        config.lon,
+        ranges[wanted].outerKm,
+        RADAR_RADIUS,
+        config.stadiaApiKey,
+        config.useLocalFeed ? config.feedHost : String(),
+        config.mapBrightness,
+        wanted
+    );
+    if (ok) {
+        lockState();
+        networkDataDirty = true;
+        unlockState();
+    }
+    return ok;
+}
+
 static bool preloadMapCache() {
     if (config.mapProvider == MapProvider::None) {
         setBootStageDetails(BOOT_MAP, "MAP BACKGROUND DISABLED", "PLAIN RADAR MODE SELECTED");
@@ -1124,6 +1391,7 @@ static bool preloadMapCache() {
             ranges[i].outerKm,
             RADAR_RADIUS,
             config.stadiaApiKey,
+            config.useLocalFeed ? config.feedHost : String(),
             config.mapBrightness,
             i,
             updateMapBootProgress,
@@ -1286,12 +1554,24 @@ static void loadConfig() {
         ? MapProvider::Stadia
         : MapProvider::None;
     config.stadiaApiKey = prefs.getString("stadiaKey", DEFAULT_STADIA_API_KEY);
+    config.feedHost = prefs.getString("feedHost", DEFAULT_FEED_HOST);
+    // A baked-in feed host is an explicit statement that this build belongs to
+    // that Pi, so it defaults to enabled -- otherwise the display would sit
+    // there with the address it needs and still ask the public API for data.
+    config.useLocalFeed =
+        prefs.getBool("feedLocal", config.feedHost.length() > 0) && config.feedHost.length() > 0;
     config.mapBrightness = static_cast<uint8_t>(std::max(
         static_cast<int>(MAP_BRIGHTNESS_MIN),
         std::min(100, static_cast<int>(prefs.getUChar("mapBright", MAP_BRIGHTNESS_DEFAULT)))
     ));
     config.configured = prefs.getBool("configured", config.ssid.length() > 0);
-    rangeIndex = std::min<size_t>(prefs.getUChar("range", 1), RANGE_COUNT - 1);
+    // 255 means this panel has never had a range chosen on it, so the Pi's
+    // range_index is used instead. Any local choice wins from then on.
+    uint8_t storedRange = prefs.getUChar("range", 255);
+    rangeIsLocal = storedRange != 255;
+    if (rangeIsLocal) {
+        rangeIndex = std::min<size_t>(storedRange, RANGE_COUNT - 1);
+    }
 }
 
 static void saveConfig() {
@@ -1312,6 +1592,8 @@ static void saveConfig() {
     prefs.putUChar("symbols", static_cast<uint8_t>(config.aircraftSymbolStyle));
     prefs.putUChar("map", static_cast<uint8_t>(config.mapProvider));
     prefs.putString("stadiaKey", config.stadiaApiKey);
+    prefs.putString("feedHost", config.feedHost);
+    prefs.putBool("feedLocal", config.useLocalFeed && config.feedHost.length() > 0);
     prefs.putUChar("mapBright", config.mapBrightness);
     prefs.putBool("configured", config.ssid.length() > 0);
     config.configured = config.ssid.length() > 0;
@@ -1319,6 +1601,7 @@ static void saveConfig() {
 
 static void saveRange() {
     prefs.putUChar("range", static_cast<uint8_t>(rangeIndex));
+    rangeIsLocal = true;
 }
 
 static void drawStatusScreen(const String &title, const String &body) {
@@ -1498,7 +1781,12 @@ static void handleRoot() {
     body += F("%</output></div><label class='field'>Stadia Maps API key</label><input name='stadia_key' type='password' value='");
     body += htmlEscape(config.stadiaApiKey);
     body += F("'>");
-    body += F("<small>The radar continues without a map if this is empty or the map request fails.</small></section>");
+    body += F("<small>The radar continues without a map if this is empty or the map request fails.</small>");
+    body += F("<label class='field'>Local ADS-B feed host</label><input name='feed_host' value='");
+    body += htmlEscape(config.feedHost);
+    body += F("'>");
+    body += F("<small>Host:port of a pi-feed instance, e.g. 192.168.1.20:8080. Leave empty to use the public API. Switch between them from the on-device settings screen.</small></section>");
+    body += F("<input type='hidden' name='form' value='full'>");
     body += F("<button class='save' type='submit'>Save and reboot</button></form>");
     body += F("<p><a href='/screenshot.bmp'>Download current screen BMP</a></p>");
     body += F("<p><small>Tap radar: range preset. Tap an aircraft row: toggle its track. Long press: setup portal. Range is saved.</small></p>");
@@ -1570,13 +1858,27 @@ static void handleScreenshot() {
 }
 
 static void handleSave() {
-    String ssid = server.arg("ssid");
-    String password = server.arg("pass");
-    double lat = server.arg("lat").toDouble();
-    double lon = server.arg("lon").toDouble();
-    bool miles = server.hasArg("miles");
-    bool showRunways = server.hasArg("runways");
-    AirportSelectionMode airportSelectionMode = server.arg("airport_mode").toInt() ==
+    // A request that omits a field must leave it alone rather than blanking it.
+    // Checkboxes cannot express "absent" versus "unticked", so the real form
+    // carries a hidden marker; only a submission bearing it is allowed to clear
+    // them. Without this, any partial POST silently wipes the whole config --
+    // including Wi-Fi credentials -- and reboots into the setup portal.
+    const bool fullForm = server.hasArg("form");
+    auto text = [](const char *name, const String &current) {
+        return server.hasArg(name) ? server.arg(name) : current;
+    };
+    auto flag = [fullForm](const char *name, bool current) {
+        return fullForm ? server.hasArg(name) : current;
+    };
+
+    String ssid = text("ssid", config.ssid);
+    String password = text("pass", config.password);
+    double lat = server.hasArg("lat") ? server.arg("lat").toDouble() : config.lat;
+    double lon = server.hasArg("lon") ? server.arg("lon").toDouble() : config.lon;
+    bool miles = flag("miles", config.miles);
+    bool showRunways = flag("runways", config.showRunways);
+    AirportSelectionMode airportSelectionMode = text("airport_mode",
+            String(static_cast<int>(config.airportSelectionMode))).toInt() ==
             static_cast<int>(AirportSelectionMode::Manual)
         ? AirportSelectionMode::Manual
         : AirportSelectionMode::Automatic;
@@ -1594,19 +1896,24 @@ static void handleSave() {
         AIRPORT_RADIUS_MIN_KM,
         std::min<long>(AIRPORT_RADIUS_MAX_KM, requestedAirportRadius)
     ));
-    String manualAirportIcao = normalizeAirportIcao(server.arg("airport_icao"));
-    bool showLabelCallsign = server.hasArg("label_callsign");
-    bool showLabelType = server.hasArg("label_type");
-    bool showLabelAltitude = server.hasArg("label_altitude");
-    bool showLabelVerticalRate = server.hasArg("label_vrate");
-    AircraftSymbolStyle aircraftSymbolStyle = server.arg("symbol_style").toInt() ==
+    String manualAirportIcao = normalizeAirportIcao(
+        text("airport_icao", config.manualAirportIcao));
+    bool showLabelCallsign = flag("label_callsign", config.showLabelCallsign);
+    bool showLabelType = flag("label_type", config.showLabelType);
+    bool showLabelAltitude = flag("label_altitude", config.showLabelAltitude);
+    bool showLabelVerticalRate = flag("label_vrate", config.showLabelVerticalRate);
+    AircraftSymbolStyle aircraftSymbolStyle = text("symbol_style",
+            String(static_cast<int>(config.aircraftSymbolStyle))).toInt() ==
             static_cast<int>(AircraftSymbolStyle::Classic)
         ? AircraftSymbolStyle::Classic
         : AircraftSymbolStyle::DetailedIcons;
-    MapProvider mapProvider = server.arg("map").toInt() == 1
+    MapProvider mapProvider = text("map",
+            String(static_cast<int>(config.mapProvider))).toInt() == 1
         ? MapProvider::Stadia
         : MapProvider::None;
-    String stadiaApiKey = server.arg("stadia_key");
+    String stadiaApiKey = text("stadia_key", config.stadiaApiKey);
+    String feedHost = text("feed_host", config.feedHost);
+    feedHost.trim();
     int requestedMapBrightness = server.hasArg("map_brightness")
         ? server.arg("map_brightness").toInt()
         : config.mapBrightness;
@@ -1634,6 +1941,10 @@ static void handleSave() {
     config.mapProvider = mapProvider;
     config.stadiaApiKey = stadiaApiKey;
     config.mapBrightness = mapBrightness;
+    config.feedHost = feedHost;
+    if (feedHost.length() == 0) {
+        config.useLocalFeed = false;
+    }
     saveConfig();
     unlockState();
     server.send(200, "text/html", "<html><body><h1>Saved</h1><p>Rebooting...</p></body></html>");
@@ -1654,6 +1965,127 @@ static void startWebServer() {
     server.on("/screenshot", HTTP_GET, handleScreenshot);
     server.on("/screenshot.bmp", HTTP_GET, handleScreenshot);
     server.on("/save", HTTP_POST, handleSave);
+
+#if PLANE_RADAR_DEBUG_UI
+    // Debug affordances: drive the on-device UI over the network so any screen
+    // can be captured with /screenshot.bmp without physically touching the
+    // panel. Invaluable for verifying UI work on a device you cannot see.
+    server.on("/ui/settings", HTTP_GET, []() {
+        settingsActive = true;
+        settingsScrollOffset = server.hasArg("scroll")
+            ? server.arg("scroll").toInt()
+            : 0;
+        settingsRedraw = true;
+        server.send(200, "text/plain", "settings");
+    });
+    server.on("/ui/radar", HTTP_GET, []() {
+        settingsActive = false;
+        lockState();
+        networkDataDirty = true;
+        unlockState();
+        server.send(200, "text/plain", "radar");
+    });
+    server.on("/ui/select", HTTP_GET, []() {
+        lockState();
+        // No hex given: pick whatever is at the top of the visible list, so the
+        // card can be exercised without knowing an ICAO address up front.
+        String wanted = server.arg("hex");
+        strlcpy(
+            selectedAircraftHex,
+            wanted.length() > 0 ? wanted.c_str() : visibleListAircraftHex[0],
+            sizeof(selectedAircraftHex)
+        );
+        networkDataDirty = true;
+        unlockState();
+        server.send(200, "text/plain", selectedAircraftHex);
+    });
+
+    // Current rendered position of every aircraft, evaluated the same way the
+    // renderer does. Small enough to poll at video rate, which a 1.1 MB
+    // screenshot is not -- the only way to observe sub-second easing remotely.
+    server.on("/ui/positions", HTTP_GET, []() {
+        String out;
+        out.reserve(1024);
+        uint32_t now = millis();
+        lockState();
+        out += String(now);
+        out += '\n';
+        for (size_t i = 0; i < aircraftCount; i++) {
+            float lat = 0;
+            float lon = 0;
+            extrapolatedPosition(aircraft[i], now, lat, lon);
+            out += aircraft[i].hex;
+            out += ',';
+            out += String(lat, 6);
+            out += ',';
+            out += String(lon, 6);
+            out += ',';
+            out += String(aircraft[i].gsKnots, 0);
+            out += ',';
+            out += aircraft[i].callsign;
+            out += '\n';
+        }
+        // Rows the side panel is currently showing, so the list can be
+        // correlated against what is actually drawn on the radar.
+        out += "VISIBLE";
+        for (size_t r = 0; r < visibleListRowCount && r < PANEL_MAX_ROWS; r++) {
+            out += ',';
+            out += visibleListAircraftHex[r];
+        }
+        out += '\n';
+#if PLANE_RADAR_DEBUG_UI
+        for (size_t i = 0; i < debugLabelPlacementCount; i++) {
+            out += "LABEL,";
+            out += String(debugLabelPlacements[i].id);
+            out += ',';
+            out += String(debugLabelPlacements[i].x, 1);
+            out += ',';
+            out += String(debugLabelPlacements[i].y, 1);
+            out += ',';
+            out += debugLabelPlacements[i].visible ? '1' : '0';
+            out += '\n';
+        }
+#endif
+        out += "COUNTS,total=";
+        out += String(static_cast<unsigned>(aircraftCount));
+        out += ",listRows=";
+        out += String(static_cast<unsigned>(visibleListRowCount));
+        out += ",scroll=";
+        out += String(listScrollOffset);
+        out += '\n';
+        unlockState();
+        server.send(200, "text/plain", out);
+    });
+
+    server.on("/ui/touch", HTTP_GET, []() {
+        char body[420];
+        snprintf(
+            body,
+            sizeof(body),
+            "reads=%lu raw=%d,%d clamped=%d,%d\n"
+            "panel_w=%dx%d PANEL_X=%d LIST_TOP=%d ROW_H=%d\n"
+            "taps=%lu listTapCalls=%lu lastRow=%ld reject=%ld\n"
+            "visibleRows=%u panelVisibleRows=%u totalRows=%u scroll=%d\n"
+            "selected=%s settingsActive=%d\n",
+            static_cast<unsigned long>(screen.touchReadCount()),
+            screen.lastRawTouchX(), screen.lastRawTouchY(),
+            static_cast<int>(dbgTouchX), static_cast<int>(dbgTouchY),
+            screen.width(), screen.height(), PANEL_X, PANEL_LIST_TOP, PANEL_ROW_H,
+            static_cast<unsigned long>(dbgTapEvents),
+            static_cast<unsigned long>(dbgListTapCalls),
+            static_cast<long>(dbgLastRow),
+            static_cast<long>(dbgLastReject),
+            static_cast<unsigned>(visibleListRowCount),
+            static_cast<unsigned>(panelVisibleRows),
+            static_cast<unsigned>(listTotalRowCount),
+            listScrollOffset,
+            selectedAircraftHex[0] ? selectedAircraftHex : "(none)",
+            settingsActive ? 1 : 0
+        );
+        server.send(200, "text/plain", body);
+    });
+#endif // PLANE_RADAR_DEBUG_UI
+
     server.onNotFound(handleNotFound);
     server.begin();
     webServerStarted = true;
@@ -2142,13 +2574,35 @@ static void syncRouteCacheFromAircraft(uint32_t now) {
 }
 
 static bool lookupRouteForCallsign(RouteCacheEntry &entry) {
-    String url = "https://api.adsbdb.com/v0/callsign/";
+    // Prefer the local proxy: it caches results permanently and, more
+    // importantly, removes the last TLS handshake from this firmware.
+    String feedHost;
+    bool viaProxy = false;
+    lockState();
+    feedHost = config.feedHost;
+    viaProxy = config.useLocalFeed && feedHost.length() > 0;
+    unlockState();
+
+    String url;
+    if (viaProxy) {
+        url = "http://";
+        url += feedHost;
+        url += "/route/";
+    } else {
+        url = "https://api.adsbdb.com/v0/callsign/";
+    }
     url += entry.callsign;
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    std::unique_ptr<WiFiClient> client;
+    if (viaProxy) {
+        client.reset(new WiFiClient());
+    } else {
+        auto *secure = new WiFiClientSecure();
+        secure->setInsecure();
+        client.reset(secure);
+    }
     HTTPClient http;
-    if (!http.begin(client, url)) {
+    if (client == nullptr || !http.begin(*client, url)) {
         return false;
     }
     http.setTimeout(ROUTE_HTTP_TIMEOUT_MS);
@@ -2385,7 +2839,7 @@ static bool routeLabelForCallsign(
             sizeof(destination)
         );
         snprintf(out, outLen, "%s - %s", origin, destination);
-        if (g.textWidth(out) <= maxWidth) {
+        if (g.aaTextWidth(out, PanelDisplay::Canvas::AaFace::Small) <= maxWidth) {
             return out[0] != '\0';
         }
 
@@ -2393,7 +2847,9 @@ static bool routeLabelForCallsign(
         bool canShortenDestination = canShortenRoutePlace(destinationLen, destinationKeep);
         if (!canShortenOrigin && !canShortenDestination) break;
         if (canShortenOrigin &&
-            (!canShortenDestination || g.textWidth(origin) >= g.textWidth(destination))) {
+            (!canShortenDestination ||
+             g.aaTextWidth(origin, PanelDisplay::Canvas::AaFace::Small) >=
+             g.aaTextWidth(destination, PanelDisplay::Canvas::AaFace::Small))) {
             shortenRoutePlace(originLen, originKeep);
         } else {
             shortenRoutePlace(destinationLen, destinationKeep);
@@ -2447,6 +2903,172 @@ static void setLastFetchText(const String &text) {
     unlockState();
 }
 
+// Applies the site settings pi-feed serves. The receiver already knows where it
+// is, so the display never stores a position: this is what stops a freshly
+// flashed board from drawing a sky nobody is standing under.
+//
+// Range is deliberately excluded when this display has its own saved range --
+// two panels on one receiver should be able to sit at different zooms.
+static void applySiteConfig(JsonDocument &doc) {
+    lockState();
+    if (doc["position_known"].as<bool>()) {
+        config.lat = doc["lat"].as<double>();
+        config.lon = doc["lon"].as<double>();
+        config.sitePositionKnown = true;
+    } else {
+        config.sitePositionKnown = false;
+    }
+    config.miles = doc["miles"] | config.miles;
+    config.showRunways = doc["runways"] | config.showRunways;
+    config.airportSelectionMode = (doc["airport_mode"] | 0) ==
+            static_cast<int>(AirportSelectionMode::Manual)
+        ? AirportSelectionMode::Manual
+        : AirportSelectionMode::Automatic;
+    config.airportCount = static_cast<uint8_t>(std::max(
+        1,
+        std::min(
+            static_cast<int>(AIRPORT_COUNT_MAX),
+            static_cast<int>(doc["airport_count"] | static_cast<int>(AIRPORT_COUNT_DEFAULT))
+        )
+    ));
+    config.airportRadiusKm = static_cast<uint16_t>(std::max(
+        static_cast<int>(AIRPORT_RADIUS_MIN_KM),
+        std::min(
+            static_cast<int>(AIRPORT_RADIUS_MAX_KM),
+            static_cast<int>(doc["airport_radius_km"] |
+                             static_cast<int>(AIRPORT_RADIUS_DEFAULT_KM))
+        )
+    ));
+    config.manualAirportIcao = normalizeAirportIcao(doc["airport_icao"] | "");
+    config.showLabelCallsign = doc["label_callsign"] | config.showLabelCallsign;
+    config.showLabelType = doc["label_type"] | config.showLabelType;
+    config.showLabelAltitude = doc["label_altitude"] | config.showLabelAltitude;
+    config.showLabelVerticalRate = doc["label_vsi"] | config.showLabelVerticalRate;
+    config.aircraftSymbolStyle = (doc["symbols"] | 0) ==
+            static_cast<int>(AircraftSymbolStyle::Classic)
+        ? AircraftSymbolStyle::Classic
+        : AircraftSymbolStyle::DetailedIcons;
+    config.mapBrightness = static_cast<uint8_t>(std::max(
+        static_cast<int>(MAP_BRIGHTNESS_MIN),
+        std::min(100, static_cast<int>(doc["map_brightness"] |
+                                       static_cast<int>(MAP_BRIGHTNESS_DEFAULT)))
+    ));
+    if (!rangeIsLocal) {
+        rangeIndex = std::min<size_t>(doc["range_index"] | 1, RANGE_COUNT - 1);
+    }
+    unlockState();
+    selectConfiguredAirports();
+}
+
+// Keeps the last good site config so a display still comes up correctly when the
+// Pi is down -- otherwise every reboot during an outage would fall back to the
+// compiled-in position.
+static void cacheSiteConfig(const String &json) {
+    if (json.length() == 0 || json.length() > 1024) return;
+    prefs.putString("siteCfg", json);
+}
+
+static bool applyCachedSiteConfig() {
+    String cached = prefs.getString("siteCfg", "");
+    if (cached.length() == 0) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, cached)) return false;
+    applySiteConfig(doc);
+    RADAR_LOGI("[config] using cached site config (%u bytes)\n",
+               static_cast<unsigned>(cached.length()));
+    return true;
+}
+
+static bool fetchSiteConfig() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    String feedHost;
+    lockState();
+    feedHost = config.feedHost;
+    unlockState();
+    if (feedHost.length() == 0) return false;
+
+    String url = "http://";
+    url += feedHost;
+    url += "/config";
+
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, url)) return false;
+    http.setTimeout(5000);
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        RADAR_LOGI("[config] site config fetch failed http=%d\n", code);
+        http.end();
+        return false;
+    }
+    String body = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        RADAR_LOGI("[config] site config parse failed: %s\n", err.c_str());
+        return false;
+    }
+    applySiteConfig(doc);
+    cacheSiteConfig(body);
+    RADAR_LOGI("[config] site config from %s lat=%.5f lon=%.5f known=%d\n",
+               feedHost.c_str(), config.lat, config.lon,
+               static_cast<int>(config.sitePositionKnown));
+    return true;
+}
+
+// Writes a single setting back to the Pi, so a change made on one panel's
+// settings screen survives a reflash and shows up on every other panel.
+static bool pushSiteConfig(const String &patchJson) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    String feedHost;
+    lockState();
+    feedHost = config.feedHost;
+    unlockState();
+    if (feedHost.length() == 0) return false;
+
+    String url = "http://";
+    url += feedHost;
+    url += "/config";
+
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, url)) return false;
+    http.setTimeout(5000);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(patchJson);
+    bool ok = code == HTTP_CODE_OK;
+    if (ok) cacheSiteConfig(http.getString());
+    http.end();
+    if (!ok) RADAR_LOGI("[config] site config push failed http=%d\n", code);
+    return ok;
+}
+
+// Position is deliberately omitted: it belongs to the receiver, and a display
+// must never be able to talk the site into believing it is somewhere else.
+static bool pushCurrentSiteConfig() {
+    JsonDocument doc;
+    lockState();
+    doc["miles"] = config.miles;
+    doc["runways"] = config.showRunways;
+    doc["airport_mode"] = static_cast<int>(config.airportSelectionMode);
+    doc["airport_count"] = config.airportCount;
+    doc["airport_radius_km"] = config.airportRadiusKm;
+    doc["airport_icao"] = config.manualAirportIcao;
+    doc["label_callsign"] = config.showLabelCallsign;
+    doc["label_type"] = config.showLabelType;
+    doc["label_altitude"] = config.showLabelAltitude;
+    doc["label_vsi"] = config.showLabelVerticalRate;
+    doc["symbols"] = static_cast<int>(config.aircraftSymbolStyle);
+    doc["map_brightness"] = config.mapBrightness;
+    unlockState();
+    String out;
+    serializeJson(doc, out);
+    return pushSiteConfig(out);
+}
+
 static bool fetchAdsb() {
     if (WiFi.status() != WL_CONNECTED) {
         setBootStageDetails(BOOT_DATA, "ADSB REQUEST NOT STARTED", "WIFI IS NOT CONNECTED");
@@ -2475,7 +3097,25 @@ static bool fetchAdsb() {
         fetchScale = hypotf(mapHalfWidth, mapHalfHeight) / RADAR_RADIUS;
     }
     float fetchNm = (outerKm * fetchScale) / KM_PER_NM;
-    String url = "https://opendata.adsb.fi/api/v3/lat/";
+
+    String feedHost;
+    bool useLocalFeed = false;
+    lockState();
+    feedHost = config.feedHost;
+    useLocalFeed = config.useLocalFeed && feedHost.length() > 0;
+    unlockState();
+
+    // pi-feed mirrors the public API's path, so only scheme and host change.
+    // Plain HTTP on the LAN also skips the TLS handshake, which is by far the
+    // largest transient allocation this firmware makes.
+    String url;
+    if (useLocalFeed) {
+        url = "http://";
+        url += feedHost;
+        url += "/api/v3/lat/";
+    } else {
+        url = "https://opendata.adsb.fi/api/v3/lat/";
+    }
     url += String(centerLat, 6);
     url += "/lon/";
     url += String(centerLon, 6);
@@ -2501,13 +3141,25 @@ static bool fetchAdsb() {
         fetchNm,
         rangeLabel()
     );
-    strlcpy(responseLine, "HTTPS REQUEST / CONNECTING", sizeof(responseLine));
+    strlcpy(
+        responseLine,
+        useLocalFeed ? "HTTP REQUEST / CONNECTING" : "HTTPS REQUEST / CONNECTING",
+        sizeof(responseLine)
+    );
     setBootStageDetails(BOOT_DATA, endpointLine, centerLine, radiusLine, responseLine);
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    // Only build the TLS client when the request actually needs it; the
+    // handshake is by far the largest transient allocation this firmware makes.
+    std::unique_ptr<WiFiClient> client;
+    if (useLocalFeed) {
+        client.reset(new WiFiClient());
+    } else {
+        auto *secure = new WiFiClientSecure();
+        secure->setInsecure();
+        client.reset(secure);
+    }
     HTTPClient http;
-    if (!http.begin(client, url)) {
+    if (client == nullptr || !http.begin(*client, url)) {
         strlcpy(responseLine, "HTTP BEGIN FAILED", sizeof(responseLine));
         setBootStageDetails(BOOT_DATA, endpointLine, centerLine, radiusLine, responseLine);
         setLastFetchText("HTTP BEGIN FAIL");
@@ -2540,7 +3192,7 @@ static bool fetchAdsb() {
     const char *fields[] = {
         "lat", "lon", "track", "true_heading", "mag_heading", "dir",
         "gs", "tas", "ias", "baro_rate", "geom_rate", "flight", "hex",
-        "t", "category", "squawk", "alt_baro", "alt_geom"
+        "t", "category", "squawk", "alt_baro", "alt_geom", "seen_pos"
     };
     for (const char *field : fields) {
         filter["ac"][0][field] = true;
@@ -2584,7 +3236,19 @@ static bool fetchAdsb() {
             dst.lon = plane["lon"].as<float>();
             dst.renderLat = dst.lat;
             dst.renderLon = dst.lon;
-            dst.positionMs = fetchNow;
+            // Back-date to when the fix was actually taken. Treating a stale
+            // position as current makes dead reckoning run permanently ahead of
+            // the aircraft, so every refresh drags it backwards -- a ~0.4 km
+            // correction each poll at airliner speeds, which reads as a stutter.
+            float positionAgeS = 0;
+            readJsonFloat(plane, "seen_pos", positionAgeS);
+            uint32_t positionAgeMs = positionAgeS > 0
+                ? static_cast<uint32_t>(positionAgeS * 1000.0f)
+                : 0;
+            if (positionAgeMs > AIRCRAFT_EXTRAPOLATE_MAX_MS) {
+                positionAgeMs = AIRCRAFT_EXTRAPOLATE_MAX_MS;
+            }
+            dst.positionMs = positionAgeMs < fetchNow ? fetchNow - positionAgeMs : fetchNow;
             dst.noseDeg = pickHeading(plane, false);
             dst.trackDeg = pickHeading(plane, true);
             float rawTrack = 0;
@@ -2610,10 +3274,124 @@ static bool fetchAdsb() {
     char fetchStatus[24];
     snprintf(fetchStatus, sizeof(fetchStatus), "%u AIRCRAFT", static_cast<unsigned>(fetchedCount));
     lockState();
+    // Carry each aircraft's currently drawn position across the swap. The old
+    // entry still holds the data the renderer has been extrapolating from, so
+    // evaluating it at fetchNow gives exactly where the icon sits right now.
+    for (size_t i = 0; i < fetchedCount; i++) {
+        if (fetchedAircraft[i].hex[0] == '\0') continue;
+        bool matched = false;
+        float drawnLat = 0;
+        float drawnLon = 0;
+        for (size_t j = 0; j < aircraftCount; j++) {
+            if (strcmp(aircraft[j].hex, fetchedAircraft[i].hex) != 0) continue;
+            extrapolatedPosition(aircraft[j], fetchNow, drawnLat, drawnLon);
+            matched = true;
+            break;
+        }
+        if (!matched) {
+            // Not in the previous fetch: fall back to where it was last drawn,
+            // if that was recent enough for the gap to be worth smoothing.
+            for (auto &remembered : lastDrawnCache) {
+                if (remembered.hex[0] == '\0') continue;
+                if (strcmp(remembered.hex, fetchedAircraft[i].hex) != 0) continue;
+                if (fetchNow - remembered.ms <= AIRCRAFT_REAPPEAR_EASE_MS) {
+                    drawnLat = remembered.lat;
+                    drawnLon = remembered.lon;
+                    matched = true;
+                }
+                break;
+            }
+        }
+        if (matched) {
+            fetchedAircraft[i].easeLat = drawnLat;
+            fetchedAircraft[i].easeLon = drawnLon;
+            fetchedAircraft[i].easeMs = fetchNow;
+            // Spend long enough on the correction that the aircraft never
+            // appears to exceed AIRCRAFT_EASE_SPEED_FACTOR times its real speed.
+            float correctionKm = trackDistanceKm(
+                drawnLat, drawnLon,
+                fetchedAircraft[i].lat, fetchedAircraft[i].lon
+            );
+            float speedKmPerMs = fetchedAircraft[i].gsKnots * KM_PER_NM / 3600000.0f;
+            uint32_t needed = AIRCRAFT_POSITION_EASE_MIN_MS;
+            if (speedKmPerMs > 1e-9f && correctionKm > 0.0f) {
+                needed = static_cast<uint32_t>(
+                    correctionKm / (speedKmPerMs * AIRCRAFT_EASE_SPEED_FACTOR)
+                );
+            }
+            if (needed > AIRCRAFT_POSITION_EASE_MAX_MS) {
+                // Too far to cover at a plausible speed: jump, don't glide.
+                fetchedAircraft[i].hasEase = false;
+            } else {
+                fetchedAircraft[i].easeDurationMs = std::max(
+                    AIRCRAFT_POSITION_EASE_MIN_MS,
+                    needed
+                );
+                fetchedAircraft[i].hasEase = true;
+            }
+        }
+    }
+
+    // Remember every aircraft's current position so a dropout can be eased on
+    // return. Slot reuse is by hex, else the oldest entry.
+    for (size_t i = 0; i < fetchedCount; i++) {
+        if (fetchedAircraft[i].hex[0] == '\0') continue;
+        LastDrawnPosition *slot = nullptr;
+        LastDrawnPosition *oldest = &lastDrawnCache[0];
+        for (auto &entry : lastDrawnCache) {
+            if (strcmp(entry.hex, fetchedAircraft[i].hex) == 0) { slot = &entry; break; }
+            if (entry.hex[0] == '\0') { slot = &entry; break; }
+            if (entry.ms < oldest->ms) oldest = &entry;
+        }
+        if (slot == nullptr) slot = oldest;
+        strlcpy(slot->hex, fetchedAircraft[i].hex, sizeof(slot->hex));
+        slot->lat = fetchedAircraft[i].lat;
+        slot->lon = fetchedAircraft[i].lon;
+        slot->ms = fetchNow;
+    }
+
+    // Carry aircraft the feed dropped but was tracking moments ago. The feed
+    // removes anything whose last position is five seconds stale, so every
+    // reception gap longer than that -- measured running 15s to 176s -- made
+    // the row vanish and pop back on return. Measured as 4.2% of frames
+    // changing the row set on a flaky day. Held entries stop updating, so the
+    // extrapolation cap freezes them and staleness dimming marks them, which
+    // is honest; past the hold they are genuinely gone and clearing is right.
+    for (size_t i = 0; i < aircraftCount && fetchedCount < MAX_AIRCRAFT; i++) {
+        if (aircraft[i].hex[0] == '\0') continue;
+        bool stillPresent = false;
+        for (size_t j = 0; j < fetchedCount; j++) {
+            if (strcmp(fetchedAircraft[j].hex, aircraft[i].hex) == 0) {
+                stillPresent = true;
+                break;
+            }
+        }
+        if (stillPresent) continue;
+        if (aircraft[i].positionMs == 0 ||
+            fetchNow - aircraft[i].positionMs >= AIRCRAFT_LIST_HOLD_MS) {
+            continue;
+        }
+        fetchedAircraft[fetchedCount] = aircraft[i];
+        fetchedCount++;
+    }
+
     if (fetchedCount > 0) {
         memcpy(aircraft, fetchedAircraft, fetchedCount * sizeof(Aircraft));
+        aircraftCount = fetchedCount;
+        emptyFetchSinceMs = 0;
+    } else if (aircraftCount > 0) {
+        // An empty 200 is how a restarting receiver looks, not how an empty
+        // sky looks: readsb serves zero aircraft for a while after the Pi
+        // reboots, and blanking the whole list on that made every row vanish
+        // and pop back -- measured as 4.4% of frames changing the row set on
+        // a day the receiver was flapping. Hold the last list briefly; the
+        // extrapolation cap freezes held aircraft and staleness dimming marks
+        // them, which is honest, before this finally clears them.
+        if (emptyFetchSinceMs == 0) emptyFetchSinceMs = fetchNow;
+        if (fetchNow - emptyFetchSinceMs >= EMPTY_FEED_HOLD_MS) {
+            aircraftCount = 0;
+        }
     }
-    aircraftCount = fetchedCount;
     updateAircraftTracksLocked(fetchedAircraft, fetchedCount, fetchNow);
     syncRouteCacheFromAircraft(fetchNow);
     lastFetchText = fetchStatus;
@@ -2652,27 +3430,48 @@ static bool toRadarPoint(float lat, float lon, int &x, int &y, float &distKm) {
 static void extrapolatedPosition(const Aircraft &item, uint32_t now, float &lat, float &lon) {
     lat = item.lat;
     lon = item.lon;
-    if (item.positionMs == 0 || item.gsKnots < 1.0f) {
+
+    if (item.positionMs != 0 && item.gsKnots >= 1.0f) {
+        // Dead reckoning from ground speed and track, deliberately in preference
+        // to interpolating between fixes. Measured on this receiver: replacing
+        // this with a 3 s interpolation buffer raised stalled frames from 1.3%
+        // to 7.1% and p90 apparent speed from 1.02x to 1.28x, because ADS-B
+        // fixes are quantised and irregularly spaced -- interpolating between
+        // them reproduces that noise, while this model does not.
+        uint32_t ageMs = now - item.positionMs;
+        if (ageMs > AIRCRAFT_EXTRAPOLATE_MAX_MS) {
+            ageMs = AIRCRAFT_EXTRAPOLATE_MAX_MS;
+        }
+
+        float distanceKm = item.gsKnots * KM_PER_NM * (static_cast<float>(ageMs) / 3600000.0f);
+        if (distanceKm >= 0.001f) {
+            float trackRad = item.trackDeg * DEG_TO_RAD;
+            float northKm = cosf(trackRad) * distanceKm;
+            float eastKm = sinf(trackRad) * distanceKm;
+            float lonScale = KM_PER_DEG * std::max(0.1f, fabsf(cosf(item.lat * DEG_TO_RAD)));
+
+            lat = item.lat + northKm / KM_PER_DEG;
+            lon = item.lon + eastKm / lonScale;
+        }
+    }
+
+    // Blend out of the position this aircraft was last drawn at, so a fresh fix
+    // corrects the prediction over a few frames rather than in one jump. The
+    // target keeps advancing during the blend, so motion stays continuous.
+    if (!item.hasEase || now < item.easeMs) {
         return;
     }
-
-    uint32_t ageMs = now - item.positionMs;
-    if (ageMs > AIRCRAFT_EXTRAPOLATE_MAX_MS) {
-        ageMs = AIRCRAFT_EXTRAPOLATE_MAX_MS;
-    }
-
-    float distanceKm = item.gsKnots * KM_PER_NM * (static_cast<float>(ageMs) / 3600000.0f);
-    if (distanceKm < 0.001f) {
+    uint32_t easeDuration = item.easeDurationMs > 0
+        ? item.easeDurationMs
+        : AIRCRAFT_POSITION_EASE_MIN_MS;
+    uint32_t easeAge = now - item.easeMs;
+    if (easeAge >= easeDuration) {
         return;
     }
-
-    float trackRad = item.trackDeg * DEG_TO_RAD;
-    float northKm = cosf(trackRad) * distanceKm;
-    float eastKm = sinf(trackRad) * distanceKm;
-    float lonScale = KM_PER_DEG * std::max(0.1f, fabsf(cosf(item.lat * DEG_TO_RAD)));
-
-    lat = item.lat + northKm / KM_PER_DEG;
-    lon = item.lon + eastKm / lonScale;
+    float t = static_cast<float>(easeAge) / static_cast<float>(easeDuration);
+    t = t * t * (3.0f - 2.0f * t);   // smoothstep, so it leaves and arrives gently
+    lat = item.easeLat + (lat - item.easeLat) * t;
+    lon = item.easeLon + (lon - item.easeLon) * t;
 }
 
 static bool isInsideMapViewport(int x, int y) {
@@ -2719,6 +3518,37 @@ static void prepareAircraftGeometry(
     std::sort(items, items + itemCount, [](const Aircraft &a, const Aircraft &b) {
         return a.distanceKm > b.distanceKm;
     });
+
+    // Order hysteresis. The sort runs every frame on distances that dither by a
+    // few hundred metres between fixes, so two aircraft at nearly the same
+    // range swapped rows every few seconds -- measured at 5% of frames, and
+    // each swap moves two whole rows, which is the most visible motion left on
+    // the panel. A pair keeps its previous relative order unless the gap is
+    // decisive; a genuine overtake closes 1.5 km in seconds at airliner speeds
+    // and reorders exactly as before, just once.
+    static char prevOrderHex[MAX_AIRCRAFT][7] = {};
+    static size_t prevOrderCount = 0;
+    auto prevRank = [&](const Aircraft &a) -> int {
+        for (size_t i = 0; i < prevOrderCount; i++) {
+            if (strcmp(prevOrderHex[i], a.hex) == 0) return static_cast<int>(i);
+        }
+        return -1;   // not seen last frame: no stickiness, distance decides
+    };
+    for (size_t i = 0; i + 1 < itemCount; i++) {
+        Aircraft &a = items[i];       // descending: a is the farther of the pair
+        Aircraft &b = items[i + 1];
+        int rankA = prevRank(a);
+        int rankB = prevRank(b);
+        if (rankA < 0 || rankB < 0 || rankA <= rankB) continue;
+        if (a.distanceKm - b.distanceKm >= LIST_SWAP_DEADBAND_KM) continue;
+        Aircraft tmp = a;
+        a = b;
+        b = tmp;
+    }
+    prevOrderCount = std::min(itemCount, MAX_AIRCRAFT);
+    for (size_t i = 0; i < prevOrderCount; i++) {
+        strlcpy(prevOrderHex[i], items[i].hex, sizeof(prevOrderHex[i]));
+    }
 }
 
 static bool clipTrackLineToMapViewport(int &x0, int &y0, int &x1, int &y1) {
@@ -2915,7 +3745,8 @@ static uint8_t planeSizeClass(const Aircraft &item) {
 }
 
 template <typename Gfx>
-static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClass) {
+static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClass,
+                      uint16_t color) {
     int tipLen = 12;
     int tailLen = 8;
     int wingLen = 6;
@@ -2938,11 +3769,15 @@ static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClas
     int tailY = cy + lroundf(c * tailLen);
     int wingX = lroundf(c * wingLen);
     int wingY = lroundf(s * wingLen);
-    g.fillTriangle(tipX, tipY, tailX + wingX, tailY + wingY, tailX - wingX, tailY - wingY, colorPlane);
+    g.fillTriangle(tipX, tipY, tailX + wingX, tailY + wingY, tailX - wingX, tailY - wingY, color);
 }
 
 template <typename Gfx>
-static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
+static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy, bool stale) {
+    // A held position is not a position. Dimming is the whole signal that the
+    // symbol is the last known spot rather than where the aircraft is now.
+    const uint16_t iconColor = stale ? colorDim : colorWarn;
+    const uint16_t bodyColor = stale ? colorDim : colorPlane;
     if (config.aircraftSymbolStyle == AircraftSymbolStyle::DetailedIcons) {
         AircraftIcons::draw(
             g,
@@ -2951,7 +3786,7 @@ static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
             item.noseDeg,
             cx,
             cy,
-            colorWarn
+            iconColor
         );
         return;
     }
@@ -2966,20 +3801,32 @@ static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
         g.drawWideLine(
             cx - rotor1X, cy - rotor1Y,
             cx + rotor1X, cy + rotor1Y,
-            2.0f, colorPlane
+            2.0f, bodyColor
         );
         g.drawWideLine(
             cx - rotor2X, cy - rotor2Y,
             cx + rotor2X, cy + rotor2Y,
-            2.0f, colorPlane
+            2.0f, bodyColor
         );
 
         int tailX = cx - lroundf(s * 7);
         int tailY = cy + lroundf(c * 7);
-        g.drawWideLine(cx, cy, tailX, tailY, 2.0f, colorPlane);
+        g.drawWideLine(cx, cy, tailX, tailY, 2.0f, bodyColor);
         return;
     }
-    drawPlane(g, cx, cy, item.noseDeg, planeSizeClass(item));
+    drawPlane(g, cx, cy, item.noseDeg, planeSizeClass(item), bodyColor);
+}
+
+// True once the newest fix is old enough that what is drawn is a held position
+// rather than a current one.
+static bool aircraftPositionStale(const Aircraft &item, uint32_t now) {
+    if (item.positionMs == 0) return false;
+    return (now - item.positionMs) > AIRCRAFT_STALE_MS;
+}
+
+static bool aircraftPositionHidden(const Aircraft &item, uint32_t now) {
+    if (item.positionMs == 0) return false;
+    return (now - item.positionMs) > AIRCRAFT_HIDDEN_MS;
 }
 
 static uint32_t aircraftLabelId(const Aircraft &item) {
@@ -3061,7 +3908,7 @@ static size_t prepareRadarLabels(
             RadarLabelLine &line = label.lines[label.lineCount++];
             strlcpy(line.text, text, sizeof(line.text));
             line.color = color;
-            line.width = g.textWidth(line.text);
+            line.width = g.aaTextWidth(line.text, PanelDisplay::Canvas::AaFace::Small);
             label.width = std::max(label.width, line.width);
         };
 
@@ -3087,6 +3934,9 @@ static size_t prepareRadarLabels(
             static_cast<int>(label.lineCount - 1) * AIRCRAFT_LABEL_LINE_ADVANCE +
             AIRCRAFT_LABEL_PADDING * 2;
 
+        // A hidden aircraft keeps its row but loses its symbol; its label
+        // must follow the symbol, not point at empty scope.
+        if (aircraftPositionHidden(item, millis())) continue;
         RadarLabels::LabelLayoutInput &input = labelLayoutInputs[labelCount];
         input = RadarLabels::LabelLayoutInput();
         input.id = aircraftLabelId(item);
@@ -3172,7 +4022,7 @@ static void appendTokenIfFits(
         line[originalLen] = '\0';
     }
     strlcat(line, token, lineLen);
-    if (g.textWidth(line) > maxWidth) {
+    if (g.aaTextWidth(line, PanelDisplay::Canvas::AaFace::Small) > maxWidth) {
         line[originalLen - separatorLen] = '\0';
     }
 }
@@ -3188,48 +4038,100 @@ static void drawAircraftList(
     const char *selectedHex
 ) {
     g.fillRect(PANEL_X, 0, SCREEN_W - PANEL_X, SCREEN_H, colorBg);
-    g.drawWideLine(PANEL_X - 8, 18, PANEL_X - 8, SCREEN_H - 18, 1.0f, colorGrid);
     visibleListRowCount = 0;
     memset(visibleListAircraftHex, 0, sizeof(visibleListAircraftHex));
 
-    g.setTextDatum(textdatum_t::top_right);
-    g.setTextSize(2);
-    g.setTextColor(colorDim, colorBg);
-    char rangeTitle[24];
-    snprintf(rangeTitle, sizeof(rangeTitle), "RANGE %s", rangeLabel());
-    g.drawString(rangeTitle, PANEL_RIGHT, 10);
+    // Range as a chip rather than floating caps text: it is a control -- tap
+    // the radar to cycle it -- and controls should look tappable. The count
+    // sits beside it so the two read as one header line.
+    using AaFace = PanelDisplay::Canvas::AaFace;
+    {
+        const char *rangeText = rangeLabel();
+        int tw = g.aaTextWidth(rangeText, AaFace::Small);
+        int chipW = tw + 24, chipH = 26;
+        int chipX = PANEL_RIGHT - chipW, chipY = 10;
+        g.fillRoundRect(chipX, chipY, chipW, chipH, 8, colorCard);
+        g.drawAaString(rangeText, chipX + 12, chipY + 4, AaFace::Small, colorText);
+        char countText[20];
+        snprintf(countText, sizeof(countText), "%u TRACKING",
+                 static_cast<unsigned>(itemCount));
+        g.drawAaString(countText, chipX - 14 - g.aaTextWidth(countText, AaFace::Small),
+                       chipY + 4, AaFace::Small, colorDim);
+    }
 
-    int textWidth = PANEL_RIGHT - PANEL_TEXT_X;
-    int maxRows = static_cast<int>(panelVisibleRows);
+    // An unconfigured board used to draw the compiled-in position with nothing
+    // to distinguish it from a real one -- which is exactly how a display ends
+    // up showing a sky nobody is standing under. Say it outright instead.
+    if (!config.sitePositionKnown) {
+        g.setTextDatum(textdatum_t::top_right);
+        g.setTextSize(1);
+        g.setTextColor(colorWarn, colorBg);
+        g.drawString("NO SITE POSITION", PANEL_RIGHT, 44);
+    }
+
+    int textWidth = PANEL_RIGHT - (PANEL_X + LIST_CARD_INSET + 60);
+
+    // Give up the bottom of the panel to the detail pane while a selection is
+    // live, but only if that aircraft is actually still being reported.
+    bool hasSelection = false;
+    if (selectedHex != nullptr && selectedHex[0] != '\0') {
+        for (size_t i = 0; i < itemCount; i++) {
+            if (strcmp(items[i].hex, selectedHex) == 0) {
+                hasSelection = true;
+                break;
+            }
+        }
+    }
+    int listBottom = SCREEN_H - (hasSelection ? DETAIL_PANE_H : 0);
+    int maxRows = std::max(
+        1,
+        std::min(
+            static_cast<int>(panelVisibleRows),
+            (listBottom - PANEL_LIST_TOP - 2) / PANEL_ROW_H
+        )
+    );
     int drawn = 0;
-    for (int idx = static_cast<int>(itemCount) - 1; idx >= 0 && drawn < maxRows; idx--) {
+
+    // Rows are drawn from the end of the sorted array backwards, so the scroll
+    // offset counts entries skipped at that end.
+    listTotalRowCount = itemCount;
+    int maxScroll = std::max(0, static_cast<int>(itemCount) - maxRows);
+    listScrollOffset = std::min(std::max(listScrollOffset, 0), maxScroll);
+
+    for (int idx = static_cast<int>(itemCount) - 1 - listScrollOffset;
+         idx >= 0 && drawn < maxRows; idx--) {
         const Aircraft &item = items[idx];
+        // Cards on a small gap: the list reads as distinct objects rather
+        // than a ruled table, which is most of what makes a panel feel
+        // current. Row pitch includes the gap.
+        using AaFace = PanelDisplay::Canvas::AaFace;
         int rowY = PANEL_LIST_TOP + drawn * PANEL_ROW_H;
-        int iconX = PANEL_X + 20;
-        int iconY = rowY + 23;
+        int cardX = PANEL_X + LIST_CARD_INSET;
+        int cardW = SCREEN_W - PANEL_X - 2 * LIST_CARD_INSET;
+        int cardH = PANEL_ROW_H - LIST_CARD_GAP;
         bool selected = selectedHex != nullptr &&
             selectedHex[0] != '\0' &&
             strcmp(item.hex, selectedHex) == 0;
-        uint16_t rowBg = selected ? colorSelectedRow : colorBg;
+        g.fillRoundRect(cardX, rowY, cardW, cardH, LIST_CARD_R,
+                        selected ? colorCardSelected : colorCard);
         if (selected) {
-            g.fillRect(
-                PANEL_X + 1,
-                rowY - 2,
-                SCREEN_W - PANEL_X - 2,
-                PANEL_ROW_H - 1,
-                rowBg
-            );
-            g.fillRect(PANEL_X + 2, rowY - 2, 3, PANEL_ROW_H - 1, colorWarn);
+            // Accent, never amber: amber is for alerts, this is a selection.
+            g.fillRect(cardX + 6, rowY + 8, 3, cardH - 16, colorAccent);
         }
 
-        drawAircraftSymbol(g, item, iconX, iconY);
+        // Heading in a dark disc: the old bare symbol floated on the
+        // background and vanished between rows. Dense and standard rows now
+        // share the same faces; density only changes the pitch.
+        int iconX = cardX + 32;
+        int iconY = rowY + cardH / 2;
+        g.fillCircle(iconX, iconY, 17, colorBg);
+        drawAircraftSymbol(g, item, iconX, iconY, aircraftPositionStale(item, millis()));
 
-        g.setTextDatum(textdatum_t::top_left);
-        g.setTextSize(2);
-        g.setTextColor(colorText, rowBg);
-        g.drawString(item.callsign[0] ? item.callsign : "????", PANEL_TEXT_X, rowY);
-
-        g.setTextSize(1);
+        const int textX = cardX + 60;
+        const int detailY = rowY + 32;
+        const int secondaryY = rowY + 48;
+        g.drawAaString(item.callsign[0] ? item.callsign : "????",
+                       textX, rowY + 7, AaFace::Large, colorText);
         char detail[96] = {};
         char distance[16];
         char speed[16];
@@ -3240,25 +4142,21 @@ static void drawAircraftList(
         appendTokenIfFits(g, detail, sizeof(detail), item.alt[0] ? item.alt : "ALT --", textWidth);
         appendTokenIfFits(g, detail, sizeof(detail), item.vsi, textWidth);
         appendTokenIfFits(g, detail, sizeof(detail), speed, textWidth);
-        g.setTextColor(colorDim, rowBg);
-        g.drawString(detail, PANEL_TEXT_X, rowY + 20);
+        g.drawAaString(detail, textX, detailY, AaFace::Small, colorDim);
 
         const char *squawkAlert = squawkAlertLabel(item.squawk);
         if (squawkAlert != nullptr) {
             char alert[32];
             snprintf(alert, sizeof(alert), "%s %s", item.squawk, squawkAlert);
-            g.setTextColor(colorWarn, rowBg);
-            g.drawString(alert, PANEL_TEXT_X, rowY + 32);
+            g.drawAaString(alert, textX, secondaryY, AaFace::Small, colorWarn);
         } else {
             char route[(ROUTE_CITY_MAX_LEN * 2) + 8];
             if (routeLabelForCallsign(
                     g, routes, routeCount, item.callsign, textWidth, route, sizeof(route))) {
-                g.setTextColor(colorRunway, rowBg);
-                g.drawString(route, PANEL_TEXT_X, rowY + 32);
+                g.drawAaString(route, textX, secondaryY, AaFace::Small, colorRunway);
             }
         }
 
-        g.drawWideLine(PANEL_X + PANEL_PAD, rowY + PANEL_ROW_H - 4, PANEL_RIGHT, rowY + PANEL_ROW_H - 4, 1.0f, colorGrid);
         strlcpy(
             visibleListAircraftHex[drawn],
             item.hex,
@@ -3268,12 +4166,134 @@ static void drawAircraftList(
         drawn++;
     }
 
+    // Scrollbar, drawn only when there is more than one screenful. Without it
+    // there is nothing on screen to suggest the list can move at all.
+    if (itemCount > static_cast<size_t>(maxRows)) {
+        int trackTop = PANEL_LIST_TOP - 2;
+        int trackH = maxRows * PANEL_ROW_H;
+        int barX = SCREEN_W - 7;
+        g.fillRect(barX, trackTop, 5, trackH, colorStroke);
+        int thumbH = std::max(24, trackH * maxRows / static_cast<int>(itemCount));
+        int span = trackH - thumbH;
+        int thumbY = trackTop +
+            (maxScroll > 0 ? span * listScrollOffset / maxScroll : 0);
+        g.fillRect(barX, thumbY, 5, thumbH, colorDim);
+    }
+
     if (drawn == 0) {
         g.setTextDatum(textdatum_t::top_left);
         g.setTextSize(1);
         g.setTextColor(colorDim, colorBg);
         g.drawString(WiFi.status() == WL_CONNECTED ? "NO AIRCRAFT" : emptyStatus, PANEL_TEXT_X, PANEL_LIST_TOP);
     }
+}
+
+// Expanded read-out for the tapped aircraft, pinned to the bottom of the side
+// panel. Everything here is already carried on Aircraft but never surfaced in
+// the list rows. Returns the height consumed so the list above can be sized to
+// match; zero when nothing is selected.
+template <typename Gfx>
+static int drawSelectedAircraftCard(
+    Gfx &g,
+    const Aircraft *items,
+    size_t itemCount,
+    const RouteCacheEntry *routes,
+    size_t routeCount,
+    const char *selectedHex
+) {
+    if (selectedHex == nullptr || selectedHex[0] == '\0') return 0;
+
+    const Aircraft *sel = nullptr;
+    for (size_t i = 0; i < itemCount; i++) {
+        if (strcmp(items[i].hex, selectedHex) == 0) {
+            sel = &items[i];
+            break;
+        }
+    }
+    if (sel == nullptr) return 0;
+
+    // A rounded card like the rows it belongs with, floating on the panel
+    // background rather than ruled off it.
+    const int CARD_X = PANEL_X + LIST_CARD_INSET;
+    const int CARD_W = SCREEN_W - PANEL_X - 2 * LIST_CARD_INSET;
+    const int CARD_H = DETAIL_PANE_H - LIST_CARD_GAP;
+    const int CARD_Y = SCREEN_H - CARD_H - LIST_CARD_GAP;
+
+    g.fillRoundRect(CARD_X, CARD_Y, CARD_W, CARD_H, LIST_CARD_R, colorCard);
+    // Accent bar matching the selected row, so the two read as one selection.
+    g.fillRect(CARD_X + 6, CARD_Y + 10, 3, CARD_H - 20, colorAccent);
+
+    using AaFace = PanelDisplay::Canvas::AaFace;
+    int tx = CARD_X + 18;
+    int ty = CARD_Y + 10;
+    int maxTextW = CARD_W - 36;
+    char line[80];
+
+    g.drawAaString(sel->callsign[0] ? sel->callsign : "????", tx, ty, AaFace::Large, colorText);
+    ty += 30;
+    g.drawWideLine(CARD_X + 14, ty, CARD_X + CARD_W - 14, ty, 1.0f, colorStroke);
+    ty += 8;
+
+    const int lineStep = 20;
+    auto detailLineStrong = [&](const char *text) {
+        g.drawAaString(text, tx, ty, AaFace::Small, colorText);
+    };
+    snprintf(
+        line,
+        sizeof(line),
+        "%s %s",
+        sel->type[0] ? sel->type : "----",
+        sel->hex[0] ? sel->hex : "------"
+    );
+    g.drawAaString(line,
+                   CARD_X + CARD_W - 14 - g.aaTextWidth(line, AaFace::Small),
+                   CARD_Y + 15, AaFace::Small, colorDim);
+    snprintf(
+        line,
+        sizeof(line),
+        "%s  %s",
+        sel->alt[0] ? sel->alt : "ALT --",
+        sel->vsi
+    );
+    detailLineStrong(line);
+    ty += lineStep;
+
+    char distance[16];
+    char speed[16];
+    formatDistanceLabel(sel->distanceKm, distance, sizeof(distance));
+    formatSpeedLabel(sel->gsKnots, speed, sizeof(speed));
+    snprintf(
+        line,
+        sizeof(line),
+        "%s  HDG %03d  %s",
+        speed,
+        static_cast<int>(sel->trackDeg + 0.5f) % 360,
+        distance
+    );
+    detailLineStrong(line);
+    ty += lineStep;
+
+    if (sel->squawk[0]) {
+        const char *alert = squawkAlertLabel(sel->squawk);
+        snprintf(
+            line,
+            sizeof(line),
+            "SQUAWK %s%s%s",
+            sel->squawk,
+            alert != nullptr ? " " : "",
+            alert != nullptr ? alert : ""
+        );
+        g.drawAaString(line, tx, ty, PanelDisplay::Canvas::AaFace::Small,
+                       alert != nullptr ? colorWarn : colorDim);
+    }
+    ty += lineStep;
+
+    char route[(ROUTE_CITY_MAX_LEN * 2) + 8];
+    if (routeLabelForCallsign(
+            g, routes, routeCount, sel->callsign, maxTextW, route, sizeof(route))) {
+        g.drawAaString(route, tx, ty, PanelDisplay::Canvas::AaFace::Small, colorRunway);
+    }
+    return CARD_H;
 }
 
 static void drawMapAttribution(PanelDisplay::Canvas &g) {
@@ -3405,7 +4425,9 @@ static void drawRadar() {
             continue;
         }
         if (x < 0 || x >= PANEL_X || y < 0 || y >= SCREEN_H) continue;
-        drawAircraftSymbol(g, renderAircraft[i], x, y);
+        if (aircraftPositionHidden(renderAircraft[i], millis())) continue;
+        drawAircraftSymbol(g, renderAircraft[i], x, y,
+                           aircraftPositionStale(renderAircraft[i], millis()));
     }
 
     size_t labelCount = prepareRadarLabels(
@@ -3460,6 +4482,15 @@ static void drawRadar() {
         &labelMetrics
     );
     uint32_t labelLayoutElapsedUs = micros() - labelLayoutStartedUs;
+#if PLANE_RADAR_DEBUG_UI
+    debugLabelPlacementCount = std::min(labelCount, MAX_AIRCRAFT);
+    for (size_t i = 0; i < debugLabelPlacementCount; i++) {
+        debugLabelPlacements[i].id = labelLayoutInputs[i].id;
+        debugLabelPlacements[i].x = labelLayoutOutputs[i].x;
+        debugLabelPlacements[i].y = labelLayoutOutputs[i].y;
+        debugLabelPlacements[i].visible = labelLayoutOutputs[i].visible;
+    }
+#endif
 
     g.setTextSize(1);
     g.setTextDatum(textdatum_t::top_left);
@@ -3483,8 +4514,8 @@ static void drawRadar() {
                     AIRCRAFT_LABEL_LINE_HEIGHT + AIRCRAFT_LABEL_PADDING * 2,
                     colorBg
                 );
-                g.setTextColor(line.color, colorBg);
-                g.drawString(line.text, textX, lineY);
+                g.drawAaString(line.text, textX, lineY,
+                               PanelDisplay::Canvas::AaFace::Small, line.color);
             }
         }
     };
@@ -3515,6 +4546,15 @@ static void drawRadar() {
         renderSelectedHex
     );
 
+    drawSelectedAircraftCard(
+        g,
+        renderAircraft,
+        renderCount,
+        renderRouteCache,
+        MAX_ROUTE_CACHE,
+        renderSelectedHex
+    );
+
     g.endWrite();
     presentScreenOrRestart();
     uint32_t completedAt = millis();
@@ -3529,17 +4569,23 @@ static void drawRadar() {
 }
 
 static bool handleAircraftListTap(uint16_t x, uint16_t y) {
+    DBG_UI(dbgListTapCalls++; dbgLastRow = -1);
     if (x < PANEL_X) {
+        DBG_UI(dbgLastReject = 1);
         return false;
     }
     if (y < PANEL_LIST_TOP) {
+        DBG_UI(dbgLastReject = 2);
         return true;
     }
 
     size_t row = static_cast<size_t>((y - PANEL_LIST_TOP) / PANEL_ROW_H);
+    DBG_UI(dbgLastRow = static_cast<int32_t>(row));
     if (row >= visibleListRowCount || row >= panelVisibleRows) {
+        DBG_UI(dbgLastReject = 3);
         return true;
     }
+    DBG_UI(dbgLastReject = 0);
 
     char tappedHex[7] = {};
     strlcpy(tappedHex, visibleListAircraftHex[row], sizeof(tappedHex));
@@ -3553,7 +4599,11 @@ static bool handleAircraftListTap(uint16_t x, uint16_t y) {
     if (strcmp(selectedAircraftHex, tappedHex) == 0) {
         selectedAircraftHex[0] = '\0';
         changed = true;
-    } else if (findAircraftTrackLocked(tappedHex) != nullptr) {
+    } else {
+        // Selection no longer requires existing track history. It used to, which
+        // made a tap on a newly appeared aircraft do nothing at all with no
+        // feedback; now the detail card shows immediately and the trail fills in
+        // once enough positions have accumulated.
         strlcpy(
             selectedAircraftHex,
             tappedHex,
@@ -3567,6 +4617,19 @@ static bool handleAircraftListTap(uint16_t x, uint16_t y) {
     }
     unlockState();
 
+    // Selecting claims DETAIL_PANE_H from the bottom of the list, which can push
+    // the row that was just tapped off screen. Scroll far enough to keep it as
+    // the last visible row.
+    if (selected) {
+        int shrunkRows = std::max(
+            1,
+            (SCREEN_H - DETAIL_PANE_H - PANEL_LIST_TOP - 2) / PANEL_ROW_H
+        );
+        if (static_cast<int>(row) >= shrunkRows) {
+            listScrollOffset += static_cast<int>(row) - shrunkRows + 1;
+        }
+    }
+
     if (changed) {
         RADAR_LOGD(
             "[track] %s hex=%s row=%u\n",
@@ -3578,6 +4641,343 @@ static bool handleAircraftListTap(uint16_t x, uint16_t y) {
     return true;
 }
 
+static const char *settingRowLabel(SettingRowId id) {
+    switch (id) {
+    case SettingRowId::Units:             return "DISTANCE UNITS";
+    case SettingRowId::Runways:           return "SHOW RUNWAYS";
+    case SettingRowId::Symbols:           return "AIRCRAFT SYMBOLS";
+    case SettingRowId::LabelCallsign:     return "LABEL: CALLSIGN";
+    case SettingRowId::LabelType:         return "LABEL: TYPE";
+    case SettingRowId::LabelAltitude:     return "LABEL: ALTITUDE";
+    case SettingRowId::LabelVerticalRate: return "LABEL: VERTICAL RATE";
+    case SettingRowId::AirportMode:       return "AIRPORT SELECTION";
+    case SettingRowId::AirportCount:      return "AIRPORT COUNT";
+    case SettingRowId::AirportRadius:     return "AIRPORT RADIUS";
+    case SettingRowId::MapProvider:       return "MAP PROVIDER";
+    case SettingRowId::MapBrightness:     return "MAP BRIGHTNESS";
+    case SettingRowId::Range:             return "RADAR RANGE";
+    case SettingRowId::FeedSource:        return "ADS-B SOURCE";
+    case SettingRowId::WebPortal:         return "WEB PORTAL";
+    case SettingRowId::Save:              return settingsRestartNeeded
+                                                 ? "SAVE & RESTART"
+                                                 : "SAVE & CLOSE";
+    default:                              return "";
+    }
+}
+
+// Steppers get -/+ hit zones; everything else toggles or cycles on a row tap.
+static bool settingRowIsStepper(SettingRowId id) {
+    return id == SettingRowId::AirportCount ||
+           id == SettingRowId::AirportRadius ||
+           id == SettingRowId::MapBrightness ||
+           id == SettingRowId::Range;
+}
+
+static bool settingRowIsAction(SettingRowId id) {
+    return id == SettingRowId::WebPortal || id == SettingRowId::Save;
+}
+
+static void settingRowValue(SettingRowId id, char *out, size_t outLen) {
+    out[0] = '\0';
+    switch (id) {
+    case SettingRowId::Units:
+        strlcpy(out, config.miles ? "MILES" : "KM", outLen);
+        break;
+    case SettingRowId::Runways:
+        strlcpy(out, config.showRunways ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::Symbols:
+        strlcpy(
+            out,
+            config.aircraftSymbolStyle == AircraftSymbolStyle::Classic
+                ? "CLASSIC"
+                : "DETAILED",
+            outLen
+        );
+        break;
+    case SettingRowId::LabelCallsign:
+        strlcpy(out, config.showLabelCallsign ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::LabelType:
+        strlcpy(out, config.showLabelType ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::LabelAltitude:
+        strlcpy(out, config.showLabelAltitude ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::LabelVerticalRate:
+        strlcpy(out, config.showLabelVerticalRate ? "ON" : "OFF", outLen);
+        break;
+    case SettingRowId::AirportMode:
+        strlcpy(
+            out,
+            config.airportSelectionMode == AirportSelectionMode::Manual
+                ? "MANUAL"
+                : "AUTOMATIC",
+            outLen
+        );
+        break;
+    case SettingRowId::AirportCount:
+        snprintf(out, outLen, "%u", static_cast<unsigned>(config.airportCount));
+        break;
+    case SettingRowId::AirportRadius:
+        snprintf(out, outLen, "%u KM", static_cast<unsigned>(config.airportRadiusKm));
+        break;
+    case SettingRowId::MapProvider:
+        strlcpy(
+            out,
+            config.mapProvider == MapProvider::Stadia ? "STADIA" : "NONE",
+            outLen
+        );
+        break;
+    case SettingRowId::MapBrightness:
+        snprintf(out, outLen, "%u%%", static_cast<unsigned>(config.mapBrightness));
+        break;
+    case SettingRowId::Range:
+        strlcpy(out, rangeLabel(), outLen);
+        break;
+    case SettingRowId::FeedSource:
+        if (config.feedHost.length() == 0) {
+            strlcpy(out, "PUBLIC / NO HOST SET", outLen);
+        } else {
+            strlcpy(out, config.useLocalFeed ? "LOCAL" : "PUBLIC", outLen);
+        }
+        break;
+    case SettingRowId::WebPortal:
+        strlcpy(out, portalActive ? "RUNNING" : "START", outLen);
+        break;
+    default:
+        break;
+    }
+}
+
+// delta is -1/+1 for stepper rows and 0 for toggles, cycles and actions.
+static void settingRowActivate(SettingRowId id, int delta) {
+    bool airportsChanged = false;
+    lockState();
+    switch (id) {
+    case SettingRowId::Units:
+        config.miles = !config.miles;
+        break;
+    case SettingRowId::Runways:
+        config.showRunways = !config.showRunways;
+        break;
+    case SettingRowId::Symbols:
+        config.aircraftSymbolStyle =
+            config.aircraftSymbolStyle == AircraftSymbolStyle::Classic
+                ? AircraftSymbolStyle::DetailedIcons
+                : AircraftSymbolStyle::Classic;
+        break;
+    case SettingRowId::LabelCallsign:
+        config.showLabelCallsign = !config.showLabelCallsign;
+        break;
+    case SettingRowId::LabelType:
+        config.showLabelType = !config.showLabelType;
+        break;
+    case SettingRowId::LabelAltitude:
+        config.showLabelAltitude = !config.showLabelAltitude;
+        break;
+    case SettingRowId::LabelVerticalRate:
+        config.showLabelVerticalRate = !config.showLabelVerticalRate;
+        break;
+    case SettingRowId::AirportMode:
+        config.airportSelectionMode =
+            config.airportSelectionMode == AirportSelectionMode::Manual
+                ? AirportSelectionMode::Automatic
+                : AirportSelectionMode::Manual;
+        airportsChanged = true;
+        break;
+    case SettingRowId::AirportCount:
+        config.airportCount = static_cast<uint8_t>(std::min(
+            static_cast<int>(AIRPORT_COUNT_MAX),
+            std::max(1, static_cast<int>(config.airportCount) + delta)
+        ));
+        airportsChanged = true;
+        break;
+    case SettingRowId::AirportRadius:
+        config.airportRadiusKm = static_cast<uint16_t>(std::min(
+            static_cast<int>(AIRPORT_RADIUS_MAX_KM),
+            std::max(
+                static_cast<int>(AIRPORT_RADIUS_MIN_KM),
+                static_cast<int>(config.airportRadiusKm) + delta * 10
+            )
+        ));
+        airportsChanged = true;
+        break;
+    case SettingRowId::MapProvider:
+        config.mapProvider = config.mapProvider == MapProvider::Stadia
+            ? MapProvider::None
+            : MapProvider::Stadia;
+        // Map views are rendered into PSRAM at boot, so this cannot take effect
+        // until the next start.
+        settingsRestartNeeded = true;
+        break;
+    case SettingRowId::MapBrightness:
+        config.mapBrightness = static_cast<uint8_t>(std::min(
+            100,
+            std::max(
+                static_cast<int>(MAP_BRIGHTNESS_MIN),
+                static_cast<int>(config.mapBrightness) + delta * 5
+            )
+        ));
+        settingsRestartNeeded = true;
+        break;
+    case SettingRowId::FeedSource:
+        // Only meaningful once a host has been entered via the web portal;
+        // there is no on-device text entry to set one.
+        if (config.feedHost.length() > 0) {
+            config.useLocalFeed = !config.useLocalFeed;
+            forceAdsbFetch = true;
+        }
+        break;
+    case SettingRowId::Range:
+        rangeIndex = static_cast<size_t>(
+            (static_cast<int>(rangeIndex) + delta + static_cast<int>(RANGE_COUNT)) %
+            static_cast<int>(RANGE_COUNT)
+        );
+        forceAdsbFetch = true;
+        break;
+    default:
+        break;
+    }
+    networkDataDirty = true;
+    // Range and the connectivity rows belong to this panel alone; everything
+    // else describes the site and is pushed back to the Pi so it outlives this
+    // board and reaches any other display.
+    if (id != SettingRowId::Range && id != SettingRowId::FeedSource &&
+        id != SettingRowId::WebPortal) {
+        siteConfigDirty = true;
+    }
+    unlockState();
+
+    if (airportsChanged) {
+        selectConfiguredAirports();
+    }
+    if (id == SettingRowId::Range) {
+        saveRange();
+    }
+}
+
+static void drawSettingsScreen() {
+    auto &g = screen;
+    int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 10) / SETTINGS_ROW_H);
+    int total = static_cast<int>(SettingRowId::Count);
+    int maxScroll = std::max(0, total - maxRows);
+    settingsScrollOffset = std::min(std::max(settingsScrollOffset, 0), maxScroll);
+
+    int minusX = SCREEN_W - 236;
+    int plusX = SCREEN_W - 142;
+    int btnW = 68;
+    int btnH = 36;
+
+    using AaFace = PanelDisplay::Canvas::AaFace;
+    const int gap = 6;
+    const int rowH = SETTINGS_ROW_H - gap;
+    maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 12) / SETTINGS_ROW_H);
+    maxScroll = std::max(0, total - maxRows);
+    settingsScrollOffset = std::min(std::max(settingsScrollOffset, 0), maxScroll);
+
+    g.startWrite();
+    g.fillScreen(colorBg);
+
+    g.drawAaString("Settings", 24, 14, AaFace::Large, colorText);
+    g.drawAaString("DRAG TO SCROLL  TAP TO CHANGE", 210, 20, AaFace::Small, colorDim);
+    g.drawWideLine(16, 48, SCREEN_W - 16, 48, 1.0f, colorStroke);
+
+    for (int slot = 0; slot < maxRows; slot++) {
+        int index = slot + settingsScrollOffset;
+        if (index >= total) break;
+        SettingRowId id = static_cast<SettingRowId>(index);
+        int rowY = SETTINGS_TOP + slot * SETTINGS_ROW_H;
+        bool action = settingRowIsAction(id);
+
+        g.fillRoundRect(16, rowY, SCREEN_W - 32, rowH, LIST_CARD_R,
+                        action ? colorCardSelected : colorCard);
+        if (action) {
+            g.fillRect(22, rowY + 8, 3, rowH - 16, colorAccent);
+        }
+
+        int labelY = rowY + (rowH - 18) / 2 + 1;
+        g.drawAaString(settingRowLabel(id), 32, labelY, AaFace::Small, colorText);
+
+        char value[24];
+        settingRowValue(id, value, sizeof(value));
+        if (value[0] != '\0') {
+            int vw = g.aaTextWidth(value, AaFace::Small);
+            int vx = settingRowIsStepper(id) ? minusX - 14 - vw : SCREEN_W - 46 - vw;
+            g.drawAaString(value, vx, labelY, AaFace::Small,
+                           action ? colorText : colorDim);
+        }
+
+        if (settingRowIsStepper(id)) {
+            int btnY = rowY + (rowH - btnH) / 2;
+            g.fillRoundRect(minusX, btnY, btnW, btnH, 8, colorCardSelected);
+            g.fillRoundRect(plusX, btnY, btnW, btnH, 8, colorCardSelected);
+            g.drawAaString("-", minusX + btnW / 2 - 3, btnY + (btnH - 18) / 2 + 1,
+                           AaFace::Small, colorAccent);
+            g.drawAaString("+", plusX + btnW / 2 - 4, btnY + (btnH - 18) / 2 + 1,
+                           AaFace::Small, colorAccent);
+        }
+    }
+
+    if (total > maxRows) {
+        int trackTop = SETTINGS_TOP;
+        int trackH = maxRows * SETTINGS_ROW_H;
+        int barX = SCREEN_W - 10;
+        g.fillRect(barX, trackTop, 5, trackH, colorGrid);
+        int thumbH = std::max(24, trackH * maxRows / total);
+        int thumbY = trackTop +
+            (maxScroll > 0 ? (trackH - thumbH) * settingsScrollOffset / maxScroll : 0);
+        g.fillRect(barX, thumbY, 5, thumbH, colorText);
+    }
+
+    g.endWrite();
+    presentScreenOrRestart();
+}
+
+static void handleSettingsTap(uint16_t x, uint16_t y) {
+    int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 10) / SETTINGS_ROW_H);
+    if (y < SETTINGS_TOP) return;
+    int slot = (static_cast<int>(y) - SETTINGS_TOP) / SETTINGS_ROW_H;
+    if (slot < 0 || slot >= maxRows) return;
+    int index = slot + settingsScrollOffset;
+    if (index >= static_cast<int>(SettingRowId::Count)) return;
+
+    SettingRowId id = static_cast<SettingRowId>(index);
+    settingsRedraw = true;
+
+    if (id == SettingRowId::WebPortal) {
+        startPortal();
+        return;
+    }
+    if (id == SettingRowId::Save) {
+        lockState();
+        saveConfig();
+        networkDataDirty = true;
+        unlockState();
+        settingsActive = false;
+        if (settingsRestartNeeded) {
+            drawStatusScreen("SAVED", "Restarting to apply map changes...");
+            delay(800);
+            ESP.restart();
+        }
+        return;
+    }
+
+    if (settingRowIsStepper(id)) {
+        int minusX = SCREEN_W - 236;
+        int plusX = SCREEN_W - 142;
+        int btnW = 68;
+        if (x >= minusX && x < minusX + btnW) {
+            settingRowActivate(id, -1);
+        } else if (x >= plusX && x < plusX + btnW) {
+            settingRowActivate(id, 1);
+        }
+        return;
+    }
+
+    settingRowActivate(id, 0);
+}
+
 static void handleTouch() {
     uint16_t x = 0;
     uint16_t y = 0;
@@ -3585,6 +4985,7 @@ static void handleTouch() {
     bool rawDown = screen.readTouch(&x, &y);
     if (rawDown) {
         touchLastContactMs = now;
+        DBG_UI(dbgTouchX = x; dbgTouchY = y);
     }
     bool down = rawDown ||
         (touchWasDown && now - touchLastContactMs < TOUCH_RELEASE_DEBOUNCE_MS);
@@ -3595,27 +4996,115 @@ static void handleTouch() {
         touchLastX = x;
         touchLastY = y;
         longPressHandled = false;
+        touchScrollAccumPx = 0;
+        touchScrolled = false;
     }
+
+    if (settingsActive) {
+        if (rawDown) {
+            touchScrollAccumPx += static_cast<int>(y) - static_cast<int>(touchLastY);
+            int maxRows = std::max(1, (SCREEN_H - SETTINGS_TOP - 12) / SETTINGS_ROW_H);
+            int maxScroll =
+                std::max(0, static_cast<int>(SettingRowId::Count) - maxRows);
+            bool moved = false;
+            while (touchScrollAccumPx >= SETTINGS_ROW_H && settingsScrollOffset > 0) {
+                settingsScrollOffset--;
+                touchScrollAccumPx -= SETTINGS_ROW_H;
+                moved = true;
+            }
+            while (touchScrollAccumPx <= -SETTINGS_ROW_H &&
+                   settingsScrollOffset < maxScroll) {
+                settingsScrollOffset++;
+                touchScrollAccumPx += SETTINGS_ROW_H;
+                moved = true;
+            }
+            touchScrollAccumPx = std::min(
+                std::max(touchScrollAccumPx, -SETTINGS_ROW_H),
+                SETTINGS_ROW_H
+            );
+            if (moved) {
+                touchScrolled = true;
+                settingsRedraw = true;
+            }
+            touchLastX = x;
+            touchLastY = y;
+        }
+        if (!down && touchWasDown) {
+            int movedX = abs(static_cast<int>(touchLastX) - touchDownX);
+            int movedY = abs(static_cast<int>(touchLastY) - touchDownY);
+            if (!touchScrolled &&
+                movedX <= TOUCH_TAP_MOVE_MAX_PX &&
+                movedY <= TOUCH_TAP_MOVE_MAX_PX) {
+                handleSettingsTap(touchDownX, touchDownY);
+            }
+        }
+        touchWasDown = down;
+        return;
+    }
+
     if (rawDown) {
+        // A drag that starts inside the panel scrolls the list. Pixels are
+        // accumulated and spent a whole row at a time so rows never land
+        // half-drawn, and the remainder is clamped so dragging past either end
+        // does not build up travel that has to be undone.
+        // Gate on the rows actually drawn, not on how many would fit with
+        // nothing selected. A detail card claims the bottom of the list, so the
+        // two disagree exactly when a card is open -- and scrolling was then
+        // refused for precisely the rows the card was covering.
+        size_t rowsShown = visibleListRowCount > 0
+            ? visibleListRowCount
+            : panelVisibleRows;
+        if (touchDownX >= PANEL_X && listTotalRowCount > rowsShown) {
+            touchScrollAccumPx += static_cast<int>(y) - static_cast<int>(touchLastY);
+            int maxScroll = static_cast<int>(listTotalRowCount) -
+                static_cast<int>(rowsShown);
+            bool moved = false;
+            while (touchScrollAccumPx >= PANEL_ROW_H && listScrollOffset > 0) {
+                listScrollOffset--;
+                touchScrollAccumPx -= PANEL_ROW_H;
+                moved = true;
+            }
+            while (touchScrollAccumPx <= -PANEL_ROW_H && listScrollOffset < maxScroll) {
+                listScrollOffset++;
+                touchScrollAccumPx += PANEL_ROW_H;
+                moved = true;
+            }
+            touchScrollAccumPx =
+                std::min(std::max(touchScrollAccumPx, -PANEL_ROW_H), PANEL_ROW_H);
+            if (moved) {
+                touchScrolled = true;
+                lockState();
+                networkDataDirty = true;
+                unlockState();
+            }
+        }
         touchLastX = x;
         touchLastY = y;
     }
-    if (down && !longPressHandled && now - touchDownMs >= TOUCH_LONG_PRESS_MS) {
+    if (down && !longPressHandled && !touchScrolled &&
+        now - touchDownMs >= TOUCH_LONG_PRESS_MS) {
         longPressHandled = true;
-        startPortal();
+        // Long press now opens the on-device settings rather than jumping
+        // straight to the web portal; the portal is a row inside it.
+        settingsActive = true;
+        settingsScrollOffset = 0;
+        settingsRestartNeeded = false;
+        settingsRedraw = true;
     }
     if (down && !longPressHandled && !configNoticeShown && now - touchDownMs >= CONFIG_HOLD_NOTICE_MS) {
         configNoticeShown = true;
-        setStatus("HOLD FOR SETUP");
+        setStatus("HOLD FOR SETTINGS");
     }
     if (!down && touchWasDown) {
         uint32_t held = now - touchDownMs;
         int movedX = abs(static_cast<int>(touchLastX) - touchDownX);
         int movedY = abs(static_cast<int>(touchLastY) - touchDownY);
         bool tap = !longPressHandled &&
+            !touchScrolled &&
             held < TOUCH_LONG_PRESS_MS &&
             movedX <= TOUCH_TAP_MOVE_MAX_PX &&
             movedY <= TOUCH_TAP_MOVE_MAX_PX;
+        if (tap) DBG_UI(dbgTapEvents++);
         if (tap && !handleAircraftListTap(touchDownX, touchDownY)) {
             lockState();
             rangeIndex = (rangeIndex + 1) % RANGE_COUNT;
@@ -3654,18 +5143,27 @@ static void networkTaskMain(void *) {
         serviceWifiReconnect(now);
         if (WiFi.status() == WL_CONNECTED) {
             bool fetchNow = false;
+            bool pushConfig = false;
             lockState();
             if (forceAdsbFetch) {
                 forceAdsbFetch = false;
                 fetchNow = true;
             }
+            if (siteConfigDirty) {
+                siteConfigDirty = false;
+                pushConfig = true;
+            }
             unlockState();
+            if (pushConfig) {
+                pushCurrentSiteConfig();
+            }
             if (fetchNow || now - lastFetchMs >= ADSB_FETCH_INTERVAL_MS) {
                 fetchAdsb();
                 lastFetchMs = millis();
             }
 
             serviceRouteLookup();
+            ensureMapForCurrentRange();
         }
 
         AppWatchdog::feed();
@@ -3695,17 +5193,24 @@ static void startNetworkTask() {
 }
 
 static void initPalette() {
-    colorBg = screen.color565(2, 8, 7);
-    colorGrid = screen.color565(8, 46, 33);
-    colorText = screen.color565(235, 255, 238);
-    colorDim = screen.color565(110, 190, 145);
+    // Neutral slate. The old green-tinted base read as a 1980s terminal once
+    // the UI gained cards and anti-aliased type; colour is now reserved for
+    // meaning: accent for selection, amber for alerts, teal for routes.
+    colorBg = screen.color565(13, 16, 22);
+    colorGrid = screen.color565(30, 36, 48);
+    colorText = screen.color565(232, 236, 244);
+    colorDim = screen.color565(148, 156, 172);
     colorPlane = screen.color565(255, 55, 80);
-    colorRunway = screen.color565(66, 210, 210);
-    colorWarn = screen.color565(255, 220, 70);
+    colorRunway = screen.color565(94, 206, 214);
+    colorWarn = screen.color565(255, 199, 95);
     colorTrackDim = screen.color565(84, 78, 30);
     colorTrackBright = screen.color565(210, 176, 42);
     colorTrackForecast = screen.color565(125, 108, 42);
-    colorSelectedRow = screen.color565(5, 28, 19);
+    colorSelectedRow = screen.color565(33, 40, 56);
+    colorCard = screen.color565(24, 28, 38);
+    colorCardSelected = screen.color565(33, 40, 56);
+    colorStroke = screen.color565(38, 44, 58);
+    colorAccent = screen.color565(86, 196, 255);
 }
 
 #if PLANE_RADAR_LOG_LEVEL >= PLANE_RADAR_LOG_LEVEL_DEBUG
@@ -3951,6 +5456,11 @@ void setup() {
                 "BACKGROUND NETWORK TASK / CORE 0"
             );
             setBootStage(BOOT_SERVICES, BootStatus::Ok);
+            // Position, airports and label settings all come from the receiver,
+            // so this has to land before anything that depends on where we are.
+            if (!fetchSiteConfig() && !applyCachedSiteConfig()) {
+                RADAR_LOGI("[config] no site config; using compiled-in defaults\n");
+            }
             preloadMapCache();
             BuildDiagnostics::logMemory("map-cache-ready");
             setBootStage(BOOT_DATA, BootStatus::Running);
@@ -4019,7 +5529,13 @@ void loop() {
     handleTouch();
 
     uint32_t now = millis();
-    if (shouldDrawRadarFrame(now)) {
+    if (settingsActive) {
+        // Redraw only on change; the settings screen is static between taps.
+        if (settingsRedraw) {
+            settingsRedraw = false;
+            drawSettingsScreen();
+        }
+    } else if (shouldDrawRadarFrame(now)) {
         drawRadar();
     }
     delay(1);

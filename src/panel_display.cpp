@@ -1,4 +1,6 @@
 #include "panel_display.h"
+#include "panel_font.h"
+#include "panel_font_aa.inc"
 #include "app_log.h"
 #include "display_tuning.h"
 
@@ -41,21 +43,24 @@ static void drainRefreshSemaphore() {
            xSemaphoreTake(refreshFinishedSemaphore, 0) == pdTRUE) {}
 }
 
-static constexpr int FONT_W = 5;
-static constexpr int FONT_H = 7;
-static constexpr int FONT_ADVANCE = 6;
-static constexpr int LINE_ADVANCE = 9;
-static constexpr int MEDIUM_FONT_W = 8;
-static constexpr int MEDIUM_FONT_H = 11;
-static constexpr int MEDIUM_FONT_ADVANCE = 10;
-static constexpr uint8_t MEDIUM_COLUMN_WIDTHS[FONT_W] = {2, 1, 2, 1, 2};
-static constexpr uint8_t MEDIUM_ROW_HEIGHTS[FONT_H] = {2, 1, 2, 1, 2, 1, 2};
+
+// Probe bus pins. The Waveshare boards expose the CH422G expander and GT911 on
+// GPIO 8/9; on the CrowPanel those two pins are RGB data lines (G3 and G0), and
+// its GT911 lives on GPIO 19/20 instead. The two pin sets are mutually
+// destructive, which is why the CrowPanel cannot be autodetected.
+#if PLANE_RADAR_BOARD_CROWPANEL7
+static constexpr int PROBE_I2C_SDA = 19;
+static constexpr int PROBE_I2C_SCL = 20;
+#else
+static constexpr int PROBE_I2C_SDA = 8;
+static constexpr int PROBE_I2C_SCL = 9;
+#endif
 
 static bool beginProbeI2c() {
     i2c_config_t config = {};
     config.mode = I2C_MODE_MASTER;
-    config.sda_io_num = static_cast<gpio_num_t>(8);
-    config.scl_io_num = static_cast<gpio_num_t>(9);
+    config.sda_io_num = static_cast<gpio_num_t>(PROBE_I2C_SDA);
+    config.scl_io_num = static_cast<gpio_num_t>(PROBE_I2C_SCL);
     config.sda_pullup_en = GPIO_PULLUP_ENABLE;
     config.scl_pullup_en = GPIO_PULLUP_ENABLE;
     config.master.clk_speed = 400000;
@@ -154,7 +159,208 @@ static bool prepare7BHardware() {
     return true;
 }
 
+#if PLANE_RADAR_BOARD_CROWPANEL7
+// CrowPanel V3.0 adds a PCA9557 that gates the GT911 reset line; V2.0 wires the
+// panel directly and has no expander. Probing lets one image serve both, so the
+// board revision never has to be known at build time.
+// PCA9557 registers: 0x00 input, 0x01 output, 0x02 polarity, 0x03 direction
+// (bit set = input).
+// IO0 is the GT911 reset line and IO1 is its interrupt line. INT must be held
+// LOW across the reset rising edge -- that level is what the GT911 latches to
+// choose its I2C address (low -> 0x5D, high -> 0x14) -- and must then be handed
+// back as an input so the controller can actually signal contacts. Sequence
+// taken from Elecrow's own V3.0 demo.
+static constexpr uint8_t PCA9557_TOUCH_RESET = 1U << 0;
+static constexpr uint8_t PCA9557_TOUCH_INT = 1U << 1;
+static uint8_t crowPanelExpanderAddress = 0;
+// The GT911 answers on 0x5D or 0x14 depending on the INT pin level latched at
+// reset. INT is not broken out here, so the level is whatever the board leaves
+// it at; the probe records which address replied and the bus is pinned to it
+// rather than trusting the driver's compiled-in default.
+static uint8_t crowPanelTouchAddress = 0;
+
+static bool writePca9557(uint8_t reg, uint8_t value) {
+    uint8_t data[2] = {reg, value};
+    return i2c_master_write_to_device(
+        I2C_NUM_0,
+        crowPanelExpanderAddress,
+        data,
+        sizeof(data),
+        pdMS_TO_TICKS(100)
+    ) == ESP_OK;
+}
+
+// Returns true when a V3.0 expander was found and the touch reset pulse was
+// issued. A false return is the normal, healthy V2.0 path, not an error.
+static bool prepareCrowPanelExpander() {
+    crowPanelExpanderAddress = 0;
+    for (uint8_t candidate : {0x19, 0x18}) {
+        uint8_t scratch = 0;
+        if (readI2cRegister8(candidate, 0x00, scratch)) {
+            crowPanelExpanderAddress = candidate;
+            break;
+        }
+    }
+    if (crowPanelExpanderAddress == 0) {
+        return false;
+    }
+
+    // Drive both RST and INT as outputs, and hold both low.
+    const uint8_t driven = static_cast<uint8_t>(PCA9557_TOUCH_RESET | PCA9557_TOUCH_INT);
+    if (!writePca9557(0x03, static_cast<uint8_t>(~driven))) return false;
+    if (!writePca9557(0x01, 0x00)) return false;
+    delay(20);
+
+    // Release reset while INT is still low, latching address 0x5D.
+    if (!writePca9557(0x01, PCA9557_TOUCH_RESET)) return false;
+    delay(100);
+
+    // Hand INT back to the controller (config bit set = input).
+    if (!writePca9557(0x03, static_cast<uint8_t>(~PCA9557_TOUCH_RESET))) return false;
+    delay(50);
+    return true;
+}
+
+static BoardConfig makeCrowPanelBoardConfig() {
+    BoardConfig config = ESP_PANEL_BOARD_DEFAULT_CONFIG;
+    config.name = "Elecrow:CrowPanel-7.0-DIS08070H";
+    config.stage_callbacks.fill(nullptr);
+    // No CH422G on this board; the compile-time default would otherwise try to
+    // drive an expander bus over two of the RGB data lines.
+    config.io_expander.reset();
+
+    auto *rgb = std::get_if<BusRGB::Config>(&config.lcd->bus_config);
+    auto *refresh = rgb == nullptr
+        ? nullptr
+        : std::get_if<BusRGB::RefreshPanelPartialConfig>(&rgb->refresh_panel);
+    if (refresh != nullptr) {
+        refresh->pclk_hz = PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ;
+        refresh->h_res = 800;
+        refresh->v_res = 480;
+        // Elecrow reference timing for the LI0704122Z panel.
+        refresh->hsync_pulse_width = 48;
+        refresh->hsync_back_porch = 40;
+        refresh->hsync_front_porch = 40;
+        refresh->vsync_pulse_width = 31;
+        refresh->vsync_back_porch = 13;
+        refresh->vsync_front_porch = 1;
+        refresh->bounce_buffer_size_px = 800 * PLANE_RADAR_RGB_BOUNCE_LINES;
+        refresh->flags_pclk_active_neg = true;
+        refresh->hsync_gpio_num = 39;
+        refresh->vsync_gpio_num = 40;
+        refresh->de_gpio_num = 41;
+        refresh->pclk_gpio_num = 0;
+        refresh->disp_gpio_num = -1;
+        // Data lines are ordered B0-B4, G0-G5, R0-R4 for RGB565.
+        const int dataPins[16] = {
+            15, 7, 6, 5, 4,          // B0-B4
+            9, 46, 3, 8, 16, 1,      // G0-G5
+            14, 21, 47, 48, 45,      // R0-R4
+        };
+        std::copy(std::begin(dataPins), std::end(dataPins), std::begin(refresh->data_gpio_nums));
+    }
+
+    auto *lcdVendor = std::get_if<LCD::VendorPartialConfig>(
+        &config.lcd->device_config.vendor
+    );
+    if (lcdVendor != nullptr) {
+        lcdVendor->hor_res = 800;
+        lcdVendor->ver_res = 480;
+    }
+
+    auto *touchBus = std::get_if<BusI2C::Config>(&config.touch->bus_config);
+    if (touchBus != nullptr) {
+        if (touchBus->host.has_value()) {
+            auto *touchHost = std::get_if<BusI2C::HostPartialConfig>(&touchBus->host.value());
+            if (touchHost != nullptr) {
+                touchHost->sda_io_num = PROBE_I2C_SDA;
+                touchHost->scl_io_num = PROBE_I2C_SCL;
+            }
+        }
+        if (crowPanelTouchAddress != 0) {
+            touchBus->control_panel.dev_addr = crowPanelTouchAddress;
+        }
+    }
+
+    auto *touchDevice = std::get_if<Touch::DevicePartialConfig>(
+        &config.touch->device_config.device
+    );
+    if (touchDevice != nullptr) {
+        touchDevice->x_max = 800;
+        touchDevice->y_max = 480;
+        // Reset is either hard-wired (V2.0) or already pulsed via the PCA9557
+        // above, and no interrupt line is broken out.
+        touchDevice->rst_gpio_num = -1;
+        touchDevice->int_gpio_num = -1;
+    }
+
+    // Backlight is a plain GPIO here, so LEDC gives real brightness control
+    // rather than the expander on/off switch the Waveshare boards use.
+    config.backlight = BoardConfig::BacklightConfig{
+        .config = BacklightPWM_LEDC::Config{
+            .ledc_channel = BacklightPWM_LEDC::LEDC_ChannelPartialConfig{
+                .io_num = 2,
+                .on_level = 1,
+            },
+        },
+        .pre_process = {.idle_off = 0},
+    };
+    return config;
+}
+#endif // PLANE_RADAR_BOARD_CROWPANEL7
+
 static Model detectAndPrepareModel() {
+#if PLANE_RADAR_BOARD_TOUCH_LCD5
+    // Shares the LCD-7's buses, so the standard probe applies; the profile is
+    // compile-time because the panel size cannot be inferred from the GT911.
+    uint16_t lcd5Width = 0;
+    uint16_t lcd5Height = 0;
+    bool lcd5Probe = false;
+    if (beginProbeI2c()) {
+        for (uint8_t attempt = 0; attempt < 3 && !lcd5Probe; attempt++) {
+            lcd5Probe = readGt911Dimensions(0x5D, lcd5Width, lcd5Height) ||
+                        readGt911Dimensions(0x14, lcd5Width, lcd5Height);
+            if (!lcd5Probe) delay(30);
+        }
+        i2c_driver_delete(I2C_NUM_0);
+    }
+    RADAR_LOGI("[display] probe gt911=%d limits=%ux%u selected=Touch-LCD-5\n",
+               lcd5Probe ? 1 : 0,
+               static_cast<unsigned>(lcd5Width),
+               static_cast<unsigned>(lcd5Height));
+    return Model::TouchLcd5;
+#elif PLANE_RADAR_BOARD_CROWPANEL7
+    uint16_t crowTouchWidth = 0;
+    uint16_t crowTouchHeight = 0;
+    bool crowProbeOk = false;
+    bool crowExpander = false;
+
+    if (beginProbeI2c()) {
+        crowExpander = prepareCrowPanelExpander();
+        for (uint8_t attempt = 0; attempt < 3 && !crowProbeOk; attempt++) {
+            for (uint8_t address : {0x5D, 0x14}) {
+                if (readGt911Dimensions(address, crowTouchWidth, crowTouchHeight)) {
+                    crowProbeOk = true;
+                    crowPanelTouchAddress = address;
+                    break;
+                }
+            }
+            if (!crowProbeOk) delay(30);
+        }
+        i2c_driver_delete(I2C_NUM_0);
+    }
+
+    RADAR_LOGI(
+        "[display] probe gt911=%d addr=0x%02X limits=%ux%u pca9557=%d rev=%s selected=CrowPanel-7.0\n",
+        crowProbeOk ? 1 : 0,
+        static_cast<unsigned>(crowPanelTouchAddress),
+        static_cast<unsigned>(crowTouchWidth),
+        static_cast<unsigned>(crowTouchHeight),
+        crowExpander ? 1 : 0,
+        crowExpander ? "V3.0" : "V2.0"
+    );
+    return Model::CrowPanel7;
+#else
     Model detected = Model::TouchLcd7;
     uint16_t touchWidth = 0;
     uint16_t touchHeight = 0;
@@ -197,7 +403,56 @@ static Model detectAndPrepareModel() {
         i2c_driver_delete(I2C_NUM_0);
     }
     return detected;
+#endif // PLANE_RADAR_BOARD_CROWPANEL7
 }
+
+#if PLANE_RADAR_BOARD_TOUCH_LCD5
+// The LCD-5 "B" panel is 1024x600 on the same board design as the LCD-7: same
+// RGB pins, same GT911 on GPIO 8/9, same CH422G driving LCD and touch reset and
+// the backlight. So unlike the 7B and the CrowPanel this keeps the compile-time
+// defaults wholesale -- including the expander and its post-begin reset
+// sequence -- and overrides only what the different panel needs.
+static BoardConfig makeLcd5BoardConfig() {
+    BoardConfig config = ESP_PANEL_BOARD_DEFAULT_CONFIG;
+    config.name = "Waveshare:ESP32-S3-Touch-LCD-5";
+
+    auto *rgb = std::get_if<BusRGB::Config>(&config.lcd->bus_config);
+    auto *refresh = rgb == nullptr
+        ? nullptr
+        : std::get_if<BusRGB::RefreshPanelPartialConfig>(&rgb->refresh_panel);
+    if (refresh != nullptr) {
+        refresh->pclk_hz = PLANE_RADAR_RGB_LCD5_PCLK_HZ;
+        refresh->h_res = 1024;
+        refresh->v_res = 600;
+        // Waveshare's own timings for this panel.
+        refresh->hsync_pulse_width = 24;
+        refresh->hsync_back_porch = 160;
+        refresh->hsync_front_porch = 160;
+        refresh->vsync_pulse_width = 2;
+        refresh->vsync_back_porch = 23;
+        refresh->vsync_front_porch = 12;
+        refresh->bounce_buffer_size_px = 1024 * PLANE_RADAR_RGB_BOUNCE_LINES;
+        refresh->flags_pclk_active_neg = true;
+    }
+
+    auto *lcdVendor = std::get_if<LCD::VendorPartialConfig>(
+        &config.lcd->device_config.vendor
+    );
+    if (lcdVendor != nullptr) {
+        lcdVendor->hor_res = 1024;
+        lcdVendor->ver_res = 600;
+    }
+
+    auto *touchDevice = std::get_if<Touch::DevicePartialConfig>(
+        &config.touch->device_config.device
+    );
+    if (touchDevice != nullptr) {
+        touchDevice->x_max = 1024;
+        touchDevice->y_max = 600;
+    }
+    return config;
+}
+#endif  // PLANE_RADAR_BOARD_TOUCH_LCD5
 
 static BoardConfig make7BBoardConfig() {
     BoardConfig config = ESP_PANEL_BOARD_DEFAULT_CONFIG;
@@ -244,80 +499,24 @@ static BoardConfig make7BBoardConfig() {
     return config;
 }
 
-static const uint8_t *glyphFor(char c) {
-    if (c == GLYPH_COPYRIGHT) {
-        static const uint8_t g[7] = {0x0E, 0x11, 0x17, 0x15, 0x17, 0x11, 0x0E};
-        return g;
-    }
-    if (c == GLYPH_ARROW_DOWN) {
-        static const uint8_t g[7] = {0x04, 0x04, 0x04, 0x04, 0x15, 0x0E, 0x04};
-        return g;
-    }
-    c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
-    switch (c) {
-    case 'A': { static const uint8_t g[7] = {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}; return g; }
-    case 'B': { static const uint8_t g[7] = {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}; return g; }
-    case 'C': { static const uint8_t g[7] = {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}; return g; }
-    case 'D': { static const uint8_t g[7] = {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}; return g; }
-    case 'E': { static const uint8_t g[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}; return g; }
-    case 'F': { static const uint8_t g[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}; return g; }
-    case 'G': { static const uint8_t g[7] = {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E}; return g; }
-    case 'H': { static const uint8_t g[7] = {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}; return g; }
-    case 'I': { static const uint8_t g[7] = {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}; return g; }
-    case 'J': { static const uint8_t g[7] = {0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E}; return g; }
-    case 'K': { static const uint8_t g[7] = {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}; return g; }
-    case 'L': { static const uint8_t g[7] = {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}; return g; }
-    case 'M': { static const uint8_t g[7] = {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}; return g; }
-    case 'N': { static const uint8_t g[7] = {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}; return g; }
-    case 'O': { static const uint8_t g[7] = {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}; return g; }
-    case 'P': { static const uint8_t g[7] = {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}; return g; }
-    case 'Q': { static const uint8_t g[7] = {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}; return g; }
-    case 'R': { static const uint8_t g[7] = {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}; return g; }
-    case 'S': { static const uint8_t g[7] = {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}; return g; }
-    case 'T': { static const uint8_t g[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}; return g; }
-    case 'U': { static const uint8_t g[7] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}; return g; }
-    case 'V': { static const uint8_t g[7] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}; return g; }
-    case 'W': { static const uint8_t g[7] = {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}; return g; }
-    case 'X': { static const uint8_t g[7] = {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}; return g; }
-    case 'Y': { static const uint8_t g[7] = {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}; return g; }
-    case 'Z': { static const uint8_t g[7] = {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}; return g; }
-    case '0': { static const uint8_t g[7] = {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}; return g; }
-    case '1': { static const uint8_t g[7] = {0x04, 0x0C, 0x14, 0x04, 0x04, 0x04, 0x1F}; return g; }
-    case '2': { static const uint8_t g[7] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}; return g; }
-    case '3': { static const uint8_t g[7] = {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E}; return g; }
-    case '4': { static const uint8_t g[7] = {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}; return g; }
-    case '5': { static const uint8_t g[7] = {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E}; return g; }
-    case '6': { static const uint8_t g[7] = {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}; return g; }
-    case '7': { static const uint8_t g[7] = {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}; return g; }
-    case '8': { static const uint8_t g[7] = {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}; return g; }
-    case '9': { static const uint8_t g[7] = {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}; return g; }
-    case ' ': { static const uint8_t g[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; return g; }
-    case '-': { static const uint8_t g[7] = {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}; return g; }
-    case '_': { static const uint8_t g[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F}; return g; }
-    case '.': { static const uint8_t g[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}; return g; }
-    case ',': { static const uint8_t g[7] = {0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08}; return g; }
-    case ':': { static const uint8_t g[7] = {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00}; return g; }
-    case '/': { static const uint8_t g[7] = {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10}; return g; }
-    case '^': { static const uint8_t g[7] = {0x04, 0x0E, 0x15, 0x04, 0x04, 0x04, 0x04}; return g; }
-    case '+': { static const uint8_t g[7] = {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00}; return g; }
-    case '=': { static const uint8_t g[7] = {0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00}; return g; }
-    case '>': { static const uint8_t g[7] = {0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10}; return g; }
-    case '(': { static const uint8_t g[7] = {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02}; return g; }
-    case ')': { static const uint8_t g[7] = {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}; return g; }
-    case '\'': { static const uint8_t g[7] = {0x0C, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00}; return g; }
-    case '?': default: { static const uint8_t g[7] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04}; return g; }
-    }
-}
 
 bool Canvas::begin() {
     RADAR_LOGD("[display] ESP32_Display_Panel backend begin\n");
     _model = detectAndPrepareModel();
+#if PLANE_RADAR_BOARD_CROWPANEL7
+    BoardConfig config = makeCrowPanelBoardConfig();
+    board = new Board(config);
+#elif PLANE_RADAR_BOARD_TOUCH_LCD5
+    BoardConfig config = makeLcd5BoardConfig();
+    board = new Board(config);
+#else
     if (_model == Model::TouchLcd7B) {
         BoardConfig config = make7BBoardConfig();
         board = new Board(config);
     } else {
         board = new Board();
     }
+#endif
     if (board == nullptr) {
         RADAR_LOGE("[display] Board allocation failed\n");
         return false;
@@ -368,7 +567,16 @@ bool Canvas::begin() {
         std::fill(_driverFb[0], _driverFb[0] + pixels, TFT_BLACK);
         std::fill(_driverFb[1], _driverFb[1] + pixels, TFT_BLACK);
         refreshFinishedSemaphore = xSemaphoreCreateBinaryStatic(&refreshFinishedSemaphoreStorage);
-        if (refreshFinishedSemaphore == nullptr || !lcd->attachRefreshFinishCallback(onRefreshFinished)) {
+        // Pass real internal-RAM user data rather than letting it default to
+        // nullptr. When XIP-on-PSRAM is off the driver asserts the ISR's user
+        // data lives in SRAM, and esp_ptr_internal(nullptr) is false; with XIP
+        // on, that check is compiled out entirely, which is the only reason a
+        // null pointer ever worked here. The semaphore storage is a plain
+        // static, so it is in .bss and satisfies the check for both SDKs.
+        if (refreshFinishedSemaphore == nullptr ||
+            !lcd->attachRefreshFinishCallback(
+                onRefreshFinished, &refreshFinishedSemaphoreStorage
+            )) {
             RADAR_LOGE("[display] refresh synchronization setup failed\n");
             return false;
         }
@@ -467,6 +675,9 @@ bool Canvas::readTouch(uint16_t *x, uint16_t *y) {
     if (count <= 0) {
         return false;
     }
+    _lastRawTouchX = points[0].x;
+    _lastRawTouchY = points[0].y;
+    _touchReadCount++;
     if (x != nullptr) *x = static_cast<uint16_t>(std::max(0, std::min(_width - 1, points[0].x)));
     if (y != nullptr) *y = static_cast<uint16_t>(std::max(0, std::min(_height - 1, points[0].y)));
     return true;
@@ -480,15 +691,21 @@ const uint16_t *Canvas::displayedFrameBuffer() const {
 }
 
 const char *Canvas::modelName() const {
-    return _model == Model::TouchLcd7B
-        ? "ESP32-S3-Touch-LCD-7B"
-        : "ESP32-S3-Touch-LCD-7";
+    switch (_model) {
+    case Model::TouchLcd7B: return "ESP32-S3-Touch-LCD-7B";
+    case Model::TouchLcd5:  return "ESP32-S3-Touch-LCD-5";
+    case Model::CrowPanel7: return "CrowPanel-7.0-DIS08070H";
+    default:                return "ESP32-S3-Touch-LCD-7";
+    }
 }
 
 uint32_t Canvas::pixelClockHz() const {
-    return _model == Model::TouchLcd7B
-        ? PLANE_RADAR_RGB_7B_PCLK_HZ
-        : PLANE_RADAR_RGB_PCLK_HZ;
+    switch (_model) {
+    case Model::TouchLcd7B: return PLANE_RADAR_RGB_7B_PCLK_HZ;
+    case Model::TouchLcd5:  return PLANE_RADAR_RGB_LCD5_PCLK_HZ;
+    case Model::CrowPanel7: return PLANE_RADAR_RGB_CROWPANEL_PCLK_HZ;
+    default:                return PLANE_RADAR_RGB_PCLK_HZ;
+    }
 }
 
 uint16_t Canvas::color565(uint8_t r, uint8_t g, uint8_t b) const {
@@ -825,6 +1042,72 @@ void Canvas::drawMediumString(const char *text, int x, int y) {
 
 void Canvas::drawMediumString(const String &text, int x, int y) {
     drawMediumString(text.c_str(), x, y);
+}
+
+int Canvas::aaTextWidth(const char *text, AaFace face) const {
+    if (text == nullptr) return 0;
+    const PanelFontAa::AaGlyph *glyphs = face == AaFace::Large
+        ? PanelFontAa::kLargeGlyphs
+        : PanelFontAa::kSmallGlyphs;
+    int width = 0;
+    for (size_t i = 0; text[i] != '\0'; i++) {
+        unsigned c = static_cast<unsigned char>(text[i]);
+        if (c < PanelFontAa::kFirstChar || c > PanelFontAa::kLastChar) continue;
+        width += glyphs[c - PanelFontAa::kFirstChar].advance;
+    }
+    return width;
+}
+
+int Canvas::aaTextWidth(const String &text, AaFace face) const {
+    return aaTextWidth(text.c_str(), face);
+}
+
+void Canvas::drawAaString(const char *text, int x, int y, AaFace face, uint16_t color) {
+    if (text == nullptr) return;
+    const PanelFontAa::AaGlyph *glyphs = face == AaFace::Large
+        ? PanelFontAa::kLargeGlyphs
+        : PanelFontAa::kSmallGlyphs;
+    const uint8_t *bitmap = face == AaFace::Large
+        ? PanelFontAa::kLargeBitmap
+        : PanelFontAa::kSmallBitmap;
+    // Glyph data is padded to whole bytes, so each hands straight to the blend.
+    int pen = x;
+    if (_datum == textdatum_t::top_right) {
+        pen = x - aaTextWidth(text, face);
+    }
+    for (size_t i = 0; text[i] != '\0'; i++) {
+        unsigned c = static_cast<unsigned char>(text[i]);
+        if (c < PanelFontAa::kFirstChar || c > PanelFontAa::kLastChar) continue;
+        const PanelFontAa::AaGlyph &g = glyphs[c - PanelFontAa::kFirstChar];
+        if (g.width > 0 && g.height > 0) {
+            blendAlphaMask4(
+                pen + g.bearingX,
+                y + g.bearingY,
+                g.width,
+                g.height,
+                bitmap + g.offset,
+                color
+            );
+        }
+        pen += g.advance;
+    }
+}
+
+void Canvas::drawAaString(const String &text, int x, int y, AaFace face, uint16_t color) {
+    drawAaString(text.c_str(), x, y, face, color);
+}
+
+void Canvas::fillRoundRect(int x, int y, int w, int h, int r, uint16_t color) {
+    if (r <= 0 || w <= 2 * r || h <= 2 * r) {
+        fillRect(x, y, w, h, color);
+        return;
+    }
+    fillRect(x + r, y, w - 2 * r, h, color);
+    fillRect(x, y + r, w, h - 2 * r, color);
+    fillCircle(x + r, y + r, r, color);
+    fillCircle(x + w - r - 1, y + r, r, color);
+    fillCircle(x + r, y + h - r - 1, r, color);
+    fillCircle(x + w - r - 1, y + h - r - 1, r, color);
 }
 
 } // namespace PanelDisplay

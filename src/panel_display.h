@@ -2,6 +2,9 @@
 
 #include <Arduino.h>
 
+// Glyph constants and the bitmap font live here so tools/preview can share them.
+#include "panel_font.h"
+
 static constexpr uint16_t TFT_BLACK = 0x0000;
 static constexpr uint16_t TFT_BLUE = 0x001F;
 static constexpr uint16_t TFT_GREEN = 0x07E0;
@@ -19,10 +22,10 @@ namespace PanelDisplay {
 enum class Model : uint8_t {
     TouchLcd7,
     TouchLcd7B,
+    TouchLcd5,
+    CrowPanel7,
 };
 
-static constexpr char GLYPH_COPYRIGHT = '\x1e';
-static constexpr char GLYPH_ARROW_DOWN = '\x1f';
 
 class Canvas {
 public:
@@ -64,8 +67,24 @@ public:
     void drawMediumString(const String &text, int x, int y);
     void drawMediumString(const char *text, int x, int y);
 
+    // Anti-aliased text from the generated atlas, drawn through the same
+    // 4-bit alpha blend the rotated aircraft icons use. Datum-aware like
+    // drawString: top_left, top_right and middle_center place the AA baseline.
+    enum class AaFace : uint8_t { Small, Large };
+    int aaTextWidth(const char *text, AaFace face) const;
+    int aaTextWidth(const String &text, AaFace face) const;
+    void drawAaString(const char *text, int x, int y, AaFace face, uint16_t color);
+    void drawAaString(const String &text, int x, int y, AaFace face, uint16_t color);
+    // RGB565 has no alpha, so a card is a solid block; the radius is what keeps
+    // it from reading as a spreadsheet row.
+    void fillRoundRect(int x, int y, int w, int h, int r, uint16_t color);
+
     int width() const { return _width; }
     int height() const { return _height; }
+    // Pre-clamp controller values, for diagnosing coordinate scaling.
+    int lastRawTouchX() const { return _lastRawTouchX; }
+    int lastRawTouchY() const { return _lastRawTouchY; }
+    uint32_t touchReadCount() const { return _touchReadCount; }
     Model model() const { return _model; }
     const char *modelName() const;
     uint32_t pixelClockHz() const;
@@ -76,6 +95,9 @@ public:
 private:
     uint16_t *_fb = nullptr;
     uint16_t *_driverFb[2] = {nullptr, nullptr};
+    int _lastRawTouchX = -1;
+    int _lastRawTouchY = -1;
+    uint32_t _touchReadCount = 0;
     int _width = 800;
     int _height = 480;
     Model _model = Model::TouchLcd7;

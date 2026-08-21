@@ -3,16 +3,19 @@
 
 #include <HTTPClient.h>
 #include <PNGdec.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <algorithm>
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <memory>
 #include <new>
 
 namespace RadarMap {
 
 static constexpr char STADIA_RASTER_TILE_URL[] =
     "https://tiles-eu.stadiamaps.com/tiles/alidade_smooth_dark/%d/%d/%d.png";
+static constexpr char PROXY_RASTER_TILE_URL[] = "http://%s/tiles/%d/%d/%d.png";
 static constexpr uint32_t MAP_HTTP_TIMEOUT_MS = 20000;
 static constexpr size_t MAP_MAX_PNG_BYTES = 256 * 1024;
 static constexpr int MAP_TILE_SIZE = 256;
@@ -387,12 +390,13 @@ static bool decodeTilePng(
 }
 
 static bool downloadTile(
-    WiFiClientSecure &client,
+    WiFiClient &client,
     HTTPClient &http,
     const MapGeometry &geometry,
     int64_t unwrappedTileX,
     int tileY,
     const String &apiKey,
+    const String &feedHost,
     uint16_t *strip,
     int stripWidth,
     int destinationX,
@@ -409,23 +413,25 @@ static bool downloadTile(
     emitProgress(progress, LoadPhase::Request, callback, callbackContext);
 
     char url[192];
-    snprintf(
-        url,
-        sizeof(url),
-        STADIA_RASTER_TILE_URL,
-        geometry.zoom,
-        tileX,
-        tileY
-    );
+    const bool viaProxy = feedHost.length() > 0;
+    if (viaProxy) {
+        snprintf(url, sizeof(url), PROXY_RASTER_TILE_URL,
+                 feedHost.c_str(), geometry.zoom, tileX, tileY);
+    } else {
+        snprintf(url, sizeof(url), STADIA_RASTER_TILE_URL,
+                 geometry.zoom, tileX, tileY);
+    }
     if (!http.begin(client, url)) {
         RADAR_LOGE("[map] tile HTTP begin failed z=%d x=%d y=%d\n",
                    geometry.zoom, tileX, tileY);
         emitProgress(progress, LoadPhase::Error, callback, callbackContext, "HTTP BEGIN FAILED");
         return false;
     }
-    String authorization = F("Stadia-Auth ");
-    authorization += apiKey;
-    http.addHeader(F("Authorization"), authorization);
+    if (!viaProxy) {
+        String authorization = F("Stadia-Auth ");
+        authorization += apiKey;
+        http.addHeader(F("Authorization"), authorization);
+    }
     int status = http.GET();
     progress.httpStatus = status;
     emitProgress(progress, LoadPhase::Response, callback, callbackContext);
@@ -532,39 +538,91 @@ static bool renderAvailableRows(
     return true;
 }
 
+// PSRAM held back from the view cache so tile decoding still has somewhere to
+// work. The largest working strip observed on the 1024x600 panel is 658 KB;
+// this leaves room for that plus the smaller allocations around it.
+static constexpr size_t kDecodeReserveBytes = 1200000;
+
 bool Background::begin(int width, int height, size_t viewCount) {
     if (_mutex == nullptr) {
         _mutex = xSemaphoreCreateMutexStatic(&_mutexStorage);
     }
-    if (_mutex == nullptr || width <= 0 || height <= 0 ||
-        viewCount == 0 || viewCount > MAX_VIEWS) {
+    if (_mutex == nullptr || width <= 0 || height <= 0 || viewCount == 0) {
+        return false;
+    }
+    if (viewCount > MAX_VIEWS) {
+        // Silently returning here disables the map with no clue why; adding a
+        // range preset without raising MAX_VIEWS looks exactly like a missing
+        // API key.
+        RADAR_LOGE("[map] viewCount=%u exceeds MAX_VIEWS=%u; map disabled\n",
+                   static_cast<unsigned>(viewCount),
+                   static_cast<unsigned>(MAX_VIEWS));
         return false;
     }
     if (_viewCount > 0) {
         return width == _width && height == _height && viewCount == _viewCount;
     }
 
+    // viewCount is reduced below to whatever memory allows; the caller's value
+    // stays the number of ranges a view may be requested for.
+    const size_t requestedViews = viewCount;
     size_t bytes = static_cast<size_t>(width) * height * sizeof(uint16_t);
     for (size_t i = 0; i < viewCount; i++) {
+        // Stop before the cache eats the PSRAM the tile decoder needs. Building
+        // each view allocates a working strip -- observed up to 658 KB at this
+        // panel size -- and it is allocated after this, so a cache that fits
+        // exactly leaves nothing to decode into and every view stays blank.
+        // Filling PSRAM here bought five cached views and zero drawn ones.
+        size_t freeSpiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        if (i > 0 && freeSpiram < bytes + kDecodeReserveBytes) {
+            RADAR_LOGE("[map] stopping at %u of %u views: %u bytes free, need "
+                       "%u plus %u reserved for tile decoding\n",
+                       static_cast<unsigned>(i),
+                       static_cast<unsigned>(viewCount),
+                       static_cast<unsigned>(freeSpiram),
+                       static_cast<unsigned>(bytes),
+                       static_cast<unsigned>(kDecodeReserveBytes));
+            viewCount = i;
+            break;
+        }
         _buffers[i] = static_cast<uint16_t *>(heap_caps_malloc(
             bytes,
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
         ));
         if (_buffers[i] == nullptr) {
-            for (size_t allocated = 0; allocated < i; allocated++) {
-                heap_caps_free(_buffers[allocated]);
-                _buffers[allocated] = nullptr;
+            if (i == 0) {
+                RADAR_LOGE("[map] framebuffer allocation failed views=%u bytes=%u\n",
+                           static_cast<unsigned>(viewCount),
+                           static_cast<unsigned>(bytes * viewCount));
+                return false;
             }
-            RADAR_LOGE("[map] framebuffer allocation failed views=%u bytes=%u\n",
+            // Keep what did fit rather than discarding the lot. A larger panel
+            // needs more per view than a smaller one -- 680x600 wants 4.90 MB
+            // for six views against 4.29 MB free, while 520x480 wants 3.00 MB
+            // and fits -- and dropping every view over a shortfall of a few
+            // hundred KB meant the bigger display showed no map at all.
+            //
+            // The dropped views are the outermost ranges, which simply draw
+            // without a background; isReady() already reports per-view state.
+            RADAR_LOGE("[map] only %u of %u views fit (%u bytes each); "
+                       "outermost %u range(s) will draw without a map\n",
+                       static_cast<unsigned>(i),
                        static_cast<unsigned>(viewCount),
-                       static_cast<unsigned>(bytes * viewCount));
-            return false;
+                       static_cast<unsigned>(bytes),
+                       static_cast<unsigned>(viewCount - i));
+            viewCount = i;
+            break;
         }
     }
     _width = width;
     _height = height;
-    _viewCount = viewCount;
+    _slotCount = viewCount;
+    _viewCount = requestedViews;
     memset(_ready, 0, sizeof(_ready));
+    for (size_t i = 0; i < MAX_VIEWS; i++) {
+        _slotView[i] = kNoView;
+        _slotUse[i] = 0;
+    }
     RADAR_LOGI("[map] cache ready size=%dx%d views=%u bytes=%u free_psram=%u\n",
                width,
                height,
@@ -580,17 +638,29 @@ bool Background::fetchStadia(
     float outerKm,
     int radarRadius,
     const String &apiKey,
+    const String &feedHost,
     uint8_t brightnessPercent,
     size_t viewIndex,
     LoadProgressCallback progressCallback,
     void *progressContext
 ) {
-    if (viewIndex >= _viewCount || _buffers[viewIndex] == nullptr || apiKey.isEmpty()) {
+    // The proxy supplies the key, so only a direct fetch needs one on-device.
+    if (viewIndex >= _viewCount || _slotCount == 0 ||
+        (feedHost.isEmpty() && apiKey.isEmpty())) {
         return false;
     }
 
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    _ready[viewIndex] = false;
+    int slot = claimSlot(viewIndex);
+    if (slot < 0 || _buffers[slot] == nullptr) {
+        xSemaphoreGive(_mutex);
+        return false;
+    }
+    // Taking the slot from whatever held it before: that view stops being
+    // drawable the moment this one starts rendering over its pixels.
+    _slotView[slot] = viewIndex;
+    _slotUse[slot] = ++_useCounter;
+    _ready[slot] = false;
     xSemaphoreGive(_mutex);
 
     MapGeometry geometry = mapGeometry(
@@ -707,8 +777,16 @@ bool Background::fetchStadia(
         static_cast<unsigned>(stripPixels * sizeof(uint16_t))
     );
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    // Only build a TLS client when actually talking to Stadia.
+    std::unique_ptr<WiFiClient> clientHolder;
+    if (feedHost.length() > 0) {
+        clientHolder.reset(new WiFiClient());
+    } else {
+        auto *secure = new WiFiClientSecure();
+        secure->setInsecure();
+        clientHolder.reset(secure);
+    }
+    WiFiClient &client = *clientHolder;
     HTTPClient http;
     http.setTimeout(MAP_HTTP_TIMEOUT_MS);
     http.setReuse(true);
@@ -731,6 +809,7 @@ bool Background::fetchStadia(
                 geometry.tileMinX + tileColumn,
                 tileY,
                 apiKey,
+                feedHost,
                 strip,
                 stripWidth,
                 tileColumn * MAP_TILE_SIZE,
@@ -749,7 +828,7 @@ bool Background::fetchStadia(
             strip,
             stripWidth,
             rowBase,
-            _buffers[viewIndex],
+            _buffers[slot],
             _width,
             _height,
             brightness,
@@ -781,7 +860,7 @@ bool Background::fetchStadia(
     }
 
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    _ready[viewIndex] = true;
+    _ready[slot] = true;
     xSemaphoreGive(_mutex);
     progress.tileIndex = progress.tileCount;
     progress.receivedBytes = 0;
@@ -798,12 +877,37 @@ bool Background::fetchStadia(
     return true;
 }
 
+int Background::slotFor(size_t viewIndex) const {
+    for (size_t i = 0; i < _slotCount; i++) {
+        if (_slotView[i] == viewIndex) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// The slot already holding this view, else a free one, else the least recently
+// drawn. Evicting the least recently used is what lets a display with fewer
+// buffers than ranges still show a map on whichever range is being looked at.
+int Background::claimSlot(size_t viewIndex) {
+    int existing = slotFor(viewIndex);
+    if (existing >= 0) return existing;
+    for (size_t i = 0; i < _slotCount; i++) {
+        if (_slotView[i] == kNoView) return static_cast<int>(i);
+    }
+    size_t oldest = 0;
+    for (size_t i = 1; i < _slotCount; i++) {
+        if (_slotUse[i] < _slotUse[oldest]) oldest = i;
+    }
+    return static_cast<int>(oldest);
+}
+
 bool Background::draw(PanelDisplay::Canvas &canvas, size_t viewIndex) {
     if (_mutex == nullptr || viewIndex >= _viewCount) return false;
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    bool ready = _ready[viewIndex] && _buffers[viewIndex] != nullptr;
+    int slot = slotFor(viewIndex);
+    bool ready = slot >= 0 && _ready[slot] && _buffers[slot] != nullptr;
     if (ready) {
-        canvas.blitRGB565(0, 0, _width, _height, _buffers[viewIndex], _width);
+        _slotUse[slot] = ++_useCounter;
+        canvas.blitRGB565(0, 0, _width, _height, _buffers[slot], _width);
     }
     xSemaphoreGive(_mutex);
     return ready;
@@ -812,15 +916,25 @@ bool Background::draw(PanelDisplay::Canvas &canvas, size_t viewIndex) {
 bool Background::isReady(size_t viewIndex) {
     if (_mutex == nullptr || viewIndex >= _viewCount) return false;
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    bool ready = _ready[viewIndex];
+    int slot = slotFor(viewIndex);
+    bool ready = slot >= 0 && _ready[slot];
     xSemaphoreGive(_mutex);
     return ready;
+}
+
+bool Background::hasSlot(size_t viewIndex) {
+    if (_mutex == nullptr || viewIndex >= _viewCount) return false;
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    bool held = slotFor(viewIndex) >= 0;
+    xSemaphoreGive(_mutex);
+    return held;
 }
 
 void Background::clear() {
     if (_mutex == nullptr) return;
     xSemaphoreTake(_mutex, portMAX_DELAY);
     memset(_ready, 0, sizeof(_ready));
+    for (size_t i = 0; i < MAX_VIEWS; i++) _slotView[i] = kNoView;
     xSemaphoreGive(_mutex);
 }
 

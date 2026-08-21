@@ -26,6 +26,10 @@ DEFAULT_WIFI_SSID="${DEFAULT_WIFI_SSID:-}"
 DEFAULT_WIFI_PASSWORD="${DEFAULT_WIFI_PASSWORD:-}"
 DEFAULT_LAT="${DEFAULT_LAT:-51.507400}"
 DEFAULT_LON="${DEFAULT_LON:--0.127800}"
+# Host:port of the pi-feed instance that owns this site's settings. Baking it in
+# is what makes a board swap cost nothing: the display then needs only Wi-Fi
+# credentials, and fetches its position and everything else from the Pi.
+DEFAULT_FEED_HOST="${DEFAULT_FEED_HOST:-}"
 DEFAULT_MAP_PROVIDER="${DEFAULT_MAP_PROVIDER:-none}"
 DEFAULT_STADIA_API_KEY="${DEFAULT_STADIA_API_KEY:-}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
@@ -33,9 +37,9 @@ RGB_BOUNCE_LINES="${RGB_BOUNCE_LINES:-10}"
 REQUIRE_HIGH_PERF="${REQUIRE_HIGH_PERF:-0}"
 
 case "$RGB_BOUNCE_LINES" in
-  10|20) ;;
+  10|20|30) ;;
   *)
-    echo "RGB_BOUNCE_LINES must be 10 or 20." >&2
+    echo "RGB_BOUNCE_LINES must be 10, 20, or 30." >&2
     exit 1
     ;;
 esac
@@ -80,7 +84,64 @@ case "$DEFAULT_MAP_PROVIDER" in
     ;;
 esac
 
-FQBN="esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,DebugLevel=$CORE_DEBUG_LEVEL,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
+DISPLAY_PROFILE="${DISPLAY_PROFILE:-0}"
+# Opt-in /ui/* HTTP routes for driving the display remotely. Off by default:
+# they let anyone on the network operate the UI.
+DEBUG_UI="${DEBUG_UI:-0}"
+
+case "$DEBUG_UI" in
+  0|1) ;;
+  *)
+    echo "DEBUG_UI must be 0 or 1." >&2
+    exit 1
+    ;;
+esac
+
+# The Waveshare boards ship 16 MB of flash; the CrowPanel has 4 MB, so it needs
+# its own layout. The firmware has no OTA path, which frees profile 9 to use
+# huge_app and hand the whole 3 MB slot to the application.
+PROFILE_FLAGS=""
+USB_OPTS="USBMode=hwcdc,CDCOnBoot=default"
+# The panel library only compiles in the backlight driver its board config
+# names, and a custom board header selects none of them by default -- board init
+# then fails outright with "Disabled or unsupported type". Every profile has to
+# ask for the driver its hardware actually uses.
+BACKLIGHT_EXPANDER=" -DESP_PANEL_DRIVERS_BACKLIGHT_USE_SWITCH_EXPANDER=1"
+case "$DISPLAY_PROFILE" in
+  0|7|8)
+    FLASH_OPTS="FlashMode=qio,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB"
+    UPLOAD_SPEED=921600
+    # Waveshare boards switch the backlight through a CH422G expander.
+    PROFILE_FLAGS="$BACKLIGHT_EXPANDER"
+    ;;
+  5)
+    FLASH_OPTS="FlashMode=qio,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB"
+    UPLOAD_SPEED=921600
+    PROFILE_FLAGS="$BACKLIGHT_EXPANDER"
+    # This board is normally used over its native USB-Serial/JTAG port, so route
+    # Serial there. With CDCOnBoot=default the log goes to the UART0 pins
+    # instead and the port looks silent even though the firmware is running.
+    USB_OPTS="USBMode=hwcdc,CDCOnBoot=cdc"
+    ;;
+  9)
+    # QIO boot-loops on this board: the ROM loader gets one segment in and then
+    # trips the watchdog before the IDF bootloader ever runs. DIO boots cleanly.
+    FLASH_OPTS="FlashMode=dio,FlashSize=4M,PartitionScheme=huge_app"
+    # The CrowPanel talks through a CH340 bridge, which is far less tolerant of
+    # high upload rates than the Waveshare CH343.
+    UPLOAD_SPEED="${UPLOAD_SPEED:-460800}"
+    # The board config header only compiles in the backlight driver it names, and
+    # it names the CH422G expander switch. The CrowPanel drives its backlight
+    # from a bare GPIO, so the LEDC driver has to be switched on explicitly.
+    PROFILE_FLAGS=" -DESP_PANEL_DRIVERS_BACKLIGHT_USE_PWM_LEDC=1"
+    ;;
+  *)
+    echo "DISPLAY_PROFILE must be 0 (auto), 5 (Touch-LCD-5), 7, 8, or 9 (CrowPanel 7.0)." >&2
+    exit 1
+    ;;
+esac
+
+FQBN="esp32:esp32:esp32s3:UploadSpeed=$UPLOAD_SPEED,$USB_OPTS,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,$FLASH_OPTS,DebugLevel=$CORE_DEBUG_LEVEL,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
 
 c_define_string() {
   local value="$1"
@@ -93,11 +154,14 @@ COMMON_FLAGS="-I$PROJECT_DIR -I$PROJECT_DIR/src -DPNG_MAX_BUFFERED_PIXELS=8322"
 CPP_FLAGS="$COMMON_FLAGS"
 CPP_FLAGS+=" -DPLANE_RADAR_LOG_LEVEL=$APP_LOG_LEVEL"
 CPP_FLAGS+=" -DPLANE_RADAR_RGB_BOUNCE_LINES=$RGB_BOUNCE_LINES"
+CPP_FLAGS+=" -DPLANE_RADAR_DISPLAY_PROFILE=$DISPLAY_PROFILE$PROFILE_FLAGS"
+CPP_FLAGS+=" -DPLANE_RADAR_DEBUG_UI=$DEBUG_UI"
 CPP_FLAGS+=" -DPLANE_RADAR_REQUIRE_HIGH_PERF=$REQUIRE_HIGH_PERF"
 CPP_FLAGS+=" -DDEFAULT_WIFI_SSID=$(c_define_string "$DEFAULT_WIFI_SSID")"
 CPP_FLAGS+=" -DDEFAULT_WIFI_PASSWORD=$(c_define_string "$DEFAULT_WIFI_PASSWORD")"
 CPP_FLAGS+=" -DDEFAULT_LAT=$DEFAULT_LAT"
 CPP_FLAGS+=" -DDEFAULT_LON=$DEFAULT_LON"
+CPP_FLAGS+=" -DDEFAULT_FEED_HOST=$(c_define_string "$DEFAULT_FEED_HOST")"
 CPP_FLAGS+=" -DDEFAULT_MAP_PROVIDER=$DEFAULT_MAP_PROVIDER_CODE"
 CPP_FLAGS+=" -DDEFAULT_STADIA_API_KEY=$(c_define_string "$DEFAULT_STADIA_API_KEY")"
 
