@@ -58,7 +58,7 @@ public:
     void clear();
 
 private:
-    static constexpr size_t MAX_VIEWS = 4;
+    static constexpr size_t MAX_VIEWS = 5;
     uint16_t *_buffers[MAX_VIEWS] = {};
     bool _ready[MAX_VIEWS] = {};
     size_t _viewCount = 0;

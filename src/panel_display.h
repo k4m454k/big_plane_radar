@@ -52,11 +52,15 @@ public:
     );
 
     void setTextSize(uint8_t size);
+    void setTextScalePercent(int percent);
+    int textScalePercent() const;
     void setTextColor(uint16_t fg);
     void setTextColor(uint16_t fg, uint16_t bg);
     void setTextDatum(textdatum_t datum);
     int textWidth(const char *text) const;
     int textWidth(const String &text) const;
+    int textHeight() const;
+    int textLineAdvance() const;
     int mediumTextWidth(const char *text) const;
     int mediumTextWidth(const String &text) const;
     void drawString(const String &text, int x, int y);
@@ -81,11 +85,13 @@ private:
     Model _model = Model::TouchLcd7;
     uint8_t _drawFbIndex = 0;
     bool _usingDriverFrameBuffers = false;
-    uint8_t _textSize = 1;
+    int _textScalePercent = 100;
     uint16_t _textFg = TFT_WHITE;
     uint16_t _textBg = TFT_BLACK;
     textdatum_t _datum = textdatum_t::top_left;
 
+    int glyphWidth() const;
+    int glyphAdvance() const;
     void drawChar(char ch, int x, int y);
     void drawMediumChar(char ch, int x, int y);
 };

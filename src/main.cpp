@@ -18,7 +18,9 @@
 #include "airport_catalog.h"
 #include "label_layout.h"
 #include "map_background.h"
+#include "ota_update.h"
 #include "panel_display.h"
+#include "weather_time.h"
 
 #ifndef DEFAULT_WIFI_SSID
 #define DEFAULT_WIFI_SSID ""
@@ -38,6 +40,9 @@
 #ifndef DEFAULT_STADIA_API_KEY
 #define DEFAULT_STADIA_API_KEY ""
 #endif
+
+static constexpr char kSetupApName[] = "BigPlaneRadar-Setup";
+static constexpr char kMdnsHostname[] = "bigplane-radar";
 
 enum class MapProvider : uint8_t {
     None = 0,
@@ -64,15 +69,21 @@ static constexpr int MAP_EDGE_MARKER_MARGIN = 5;
 static constexpr int PANEL_PAD = 10;
 static int PANEL_TEXT_X = 562;
 static int PANEL_RIGHT = 790;
-static constexpr int PANEL_LIST_TOP = 42;
+static constexpr int PANEL_LIST_TOP = 32;
 static constexpr int PANEL_ROW_H = 54;
+static constexpr int PANEL_FOOTER_H = 96;
+static constexpr int PANEL_DETAIL_H = 148;
+static constexpr int RANGE_BUTTON_W = 60;
+static constexpr int RANGE_BUTTON_H = 16;
+static constexpr int RANGE_BUTTON_GAP = 6;
 static constexpr size_t PANEL_MAX_ROWS = 12;
 static size_t panelVisibleRows = 8;
-static constexpr int AIRCRAFT_LABEL_LINE_ADVANCE = 9;
-static constexpr int AIRCRAFT_LABEL_LINE_HEIGHT = 7;
 static constexpr int AIRCRAFT_LABEL_PADDING = 1;
 static constexpr uint8_t MAP_BRIGHTNESS_MIN = 20;
 static constexpr uint8_t MAP_BRIGHTNESS_DEFAULT = 100;
+static constexpr int LABEL_TEXT_SCALE_MIN = 100;
+static constexpr int LABEL_TEXT_SCALE_MAX = 200;
+static constexpr int LABEL_TEXT_SCALE_DEFAULT = 100;
 static constexpr uint8_t AIRPORT_COUNT_DEFAULT = 1;
 static constexpr uint8_t AIRPORT_COUNT_MAX = 3;
 static constexpr uint16_t AIRPORT_RADIUS_DEFAULT_KM = 100;
@@ -102,8 +113,10 @@ static constexpr float KM_PER_NM = 1.852f;
 static constexpr float KM_PER_DEG = 111.0f;
 static constexpr size_t MAX_AIRCRAFT = 64;
 static constexpr size_t MAX_ROUTE_CACHE = 40;
+static constexpr size_t MAX_TYPE_CACHE = 32;
 static constexpr size_t MAX_AIRPORT_CITY_CACHE = 128;
 static constexpr size_t ROUTE_CITY_MAX_LEN = 48;
+static constexpr size_t TYPE_NAME_MAX_LEN = 40;
 static constexpr size_t ROUTE_CITY_MIN_PREFIX = 3;
 
 static auto &screen = PanelDisplay::screen;
@@ -124,8 +137,25 @@ static void configureDisplayLayout() {
     PANEL_RIGHT = SCREEN_W - 10;
     panelVisibleRows = std::min(
         PANEL_MAX_ROWS,
-        static_cast<size_t>(std::max(0, SCREEN_H - PANEL_LIST_TOP - 4) / PANEL_ROW_H)
+        static_cast<size_t>(std::max(0, SCREEN_H - PANEL_LIST_TOP - PANEL_FOOTER_H) / PANEL_ROW_H)
     );
+}
+
+static int panelFooterTopY() {
+    return SCREEN_H - PANEL_FOOTER_H;
+}
+
+static int panelDetailTopY() {
+    return panelFooterTopY() - PANEL_DETAIL_H;
+}
+
+static size_t listRowCapacity(bool selected) {
+    int bottom = panelFooterTopY() - (selected ? PANEL_DETAIL_H : 0);
+    int available = bottom - PANEL_LIST_TOP;
+    if (available < PANEL_ROW_H) {
+        return 0;
+    }
+    return std::min(PANEL_MAX_ROWS, static_cast<size_t>(available / PANEL_ROW_H));
 }
 
 struct AppConfig {
@@ -143,12 +173,17 @@ struct AppConfig {
     bool showLabelType = true;
     bool showLabelAltitude = true;
     bool showLabelVerticalRate = true;
+    uint8_t labelTextScalePercent = LABEL_TEXT_SCALE_DEFAULT;
     AircraftSymbolStyle aircraftSymbolStyle = AircraftSymbolStyle::DetailedIcons;
     MapProvider mapProvider = DEFAULT_MAP_PROVIDER == 1
         ? MapProvider::Stadia
         : MapProvider::None;
     String stadiaApiKey = DEFAULT_STADIA_API_KEY;
     uint8_t mapBrightness = MAP_BRIGHTNESS_DEFAULT;
+    bool showWeather = true;
+    bool tempFahrenheit = false;
+    bool clock24 = true;
+    String otaPassword = "plane-radar";
     bool configured = false;
 };
 
@@ -162,11 +197,13 @@ struct Aircraft {
     char callsign[10] = {};
     char hex[7] = {};
     char type[8] = {};
+    char registration[10] = {};
     char category[4] = {};
     char squawk[5] = {};
     char alt[14] = {};
     char vsi[12] = {};
     float distanceKm = 0;
+    float altitudeFt = -1.0e9f;
     float renderLat = 0;
     float renderLon = 0;
     int screenX = 0;
@@ -178,13 +215,17 @@ struct Aircraft {
 };
 
 struct RadarLabelLine {
-    char text[32] = {};
+    char text[40] = {};
     uint16_t color = 0;
     int width = 0;
+    int height = 0;
+    int advance = 0;
+    uint8_t textSize = 1;
 };
 
 struct RadarLabelRender {
     size_t lineCount = 0;
+    size_t aircraftIndex = MAX_AIRCRAFT;
     int width = 0;
     int height = 0;
     bool mustShow = false;
@@ -215,6 +256,8 @@ struct RouteCacheEntry {
     char callsign[10] = {};
     char originIata[4] = {};
     char destinationIata[4] = {};
+    char originIcao[5] = {};
+    char destinationIcao[5] = {};
     char originCity[ROUTE_CITY_MAX_LEN] = {};
     char destinationCity[ROUTE_CITY_MAX_LEN] = {};
     uint32_t lastSeenMs = 0;
@@ -222,6 +265,29 @@ struct RouteCacheEntry {
     bool active = false;
     bool hasRoute = false;
     bool lookupDone = false;
+};
+
+struct TypeNameCacheEntry {
+    char typeCode[8] = {};
+    char fullName[TYPE_NAME_MAX_LEN] = {};
+    uint32_t lastLookupMs = 0;
+    bool active = false;
+    bool hasName = false;
+    bool lookupDone = false;
+};
+
+struct TouchRect {
+    int x = 0;
+    int y = 0;
+    int w = 0;
+    int h = 0;
+};
+
+struct RadarHitTarget {
+    char hex[7] = {};
+    int x = 0;
+    int y = 0;
+    int radius = 0;
 };
 
 struct AirportCityCacheEntry {
@@ -236,9 +302,11 @@ static SelectedAirport selectedAirports[AIRPORT_COUNT_MAX];
 static size_t selectedAirportCount = 0;
 static Aircraft aircraft[MAX_AIRCRAFT];
 static RouteCacheEntry routeCache[MAX_ROUTE_CACHE];
+static TypeNameCacheEntry typeNameCache[MAX_TYPE_CACHE];
 static AirportCityCacheEntry airportCityCache[MAX_AIRPORT_CITY_CACHE];
 static Aircraft renderAircraft[MAX_AIRCRAFT];
 static RouteCacheEntry renderRouteCache[MAX_ROUTE_CACHE];
+static TypeNameCacheEntry renderTypeNameCache[MAX_TYPE_CACHE];
 static AircraftTrack *aircraftTracks = nullptr;
 static TrackPoint renderTrack[TRACK_POINTS_PER_AIRCRAFT];
 static RadarLabels::LabelLayout aircraftLabelLayout;
@@ -249,6 +317,10 @@ static RadarLabelRender radarLabels[MAX_AIRCRAFT];
 static char selectedAircraftHex[7] = {};
 static char visibleListAircraftHex[PANEL_MAX_ROWS][7] = {};
 static size_t visibleListRowCount = 0;
+static RadarHitTarget radarHitTargets[MAX_AIRCRAFT];
+static size_t radarHitCount = 0;
+static TouchRect rangeMinusHit;
+static TouchRect rangePlusHit;
 static size_t aircraftCount = 0;
 static String statusText = "BOOT";
 static String lastFetchText = "NO DATA";
@@ -264,6 +336,7 @@ static uint32_t lastReconnectMs = 0;
 static uint32_t lastFetchMs = 0;
 static uint32_t lastDrawMs = 0;
 static uint32_t lastRouteLookupMs = 0;
+static uint32_t lastTypeLookupMs = 0;
 static StaticSemaphore_t stateMutexStorage;
 static SemaphoreHandle_t stateMutex = nullptr;
 static TaskHandle_t networkTaskHandle = nullptr;
@@ -409,6 +482,33 @@ static size_t selectAirportsFor(
         out[insertAt].distanceKm = distanceKm;
     }
     return count;
+}
+
+static uint8_t clampLabelTextScalePercent(int value) {
+    return value >= 150 ? 200 : 100;
+}
+
+static uint8_t labelBaseTextSize(int percent) {
+    return percent >= 150 ? 2 : 1;
+}
+
+static const AirportCatalogEntry *nearestAirport(double latitude, double longitude) {
+    const AirportCatalogEntry *best = nullptr;
+    float bestDistanceKm = 1.0e30f;
+    for (size_t i = 0; i < kAirportCatalogCount; i++) {
+        const AirportCatalogEntry &airport = kAirportCatalog[i];
+        float distanceKm = trackDistanceKm(
+            static_cast<float>(latitude),
+            static_cast<float>(longitude),
+            airportCoordinate(airport.latE5),
+            airportCoordinate(airport.lonE5)
+        );
+        if (distanceKm < bestDistanceKm) {
+            bestDistanceKm = distanceKm;
+            best = &airport;
+        }
+    }
+    return best;
 }
 
 static void selectConfiguredAirports() {
@@ -594,6 +694,7 @@ static const RangePreset ranges[] = {
     {13.3f, "10km", "6mi"},
     {20.0f, "15km", "9mi"},
     {33.3f, "25km", "16mi"},
+    {66.7f, "50km", "31mi"},
 };
 static constexpr size_t RANGE_COUNT = sizeof(ranges) / sizeof(ranges[0]);
 static size_t rangeIndex = 1;
@@ -609,6 +710,8 @@ static uint16_t colorTrackDim;
 static uint16_t colorTrackBright;
 static uint16_t colorTrackForecast;
 static uint16_t colorSelectedRow;
+static uint16_t colorSelected;
+static uint16_t colorTrajectory;
 
 enum class BootStatus : uint8_t {
     Pending,
@@ -1277,6 +1380,9 @@ static void loadConfig() {
     config.showLabelType = prefs.getBool("lblType", true);
     config.showLabelAltitude = prefs.getBool("lblAlt", true);
     config.showLabelVerticalRate = prefs.getBool("lblVsi", true);
+    config.labelTextScalePercent = clampLabelTextScalePercent(
+        prefs.getUChar("lblPct", LABEL_TEXT_SCALE_DEFAULT)
+    );
     config.aircraftSymbolStyle = prefs.getUChar("symbols", 0) ==
             static_cast<uint8_t>(AircraftSymbolStyle::Classic)
         ? AircraftSymbolStyle::Classic
@@ -1290,6 +1396,13 @@ static void loadConfig() {
         static_cast<int>(MAP_BRIGHTNESS_MIN),
         std::min(100, static_cast<int>(prefs.getUChar("mapBright", MAP_BRIGHTNESS_DEFAULT)))
     ));
+    config.showWeather = prefs.getBool("showWx", true);
+    config.tempFahrenheit = prefs.getBool("tempF", false);
+    config.clock24 = prefs.getBool("clk24", true);
+    config.otaPassword = prefs.getString("otaPass", "plane-radar");
+    if (config.otaPassword.length() == 0) {
+        config.otaPassword = "plane-radar";
+    }
     config.configured = prefs.getBool("configured", config.ssid.length() > 0);
     rangeIndex = std::min<size_t>(prefs.getUChar("range", 1), RANGE_COUNT - 1);
 }
@@ -1309,10 +1422,15 @@ static void saveConfig() {
     prefs.putBool("lblType", config.showLabelType);
     prefs.putBool("lblAlt", config.showLabelAltitude);
     prefs.putBool("lblVsi", config.showLabelVerticalRate);
+    prefs.putUChar("lblPct", config.labelTextScalePercent);
     prefs.putUChar("symbols", static_cast<uint8_t>(config.aircraftSymbolStyle));
     prefs.putUChar("map", static_cast<uint8_t>(config.mapProvider));
     prefs.putString("stadiaKey", config.stadiaApiKey);
     prefs.putUChar("mapBright", config.mapBrightness);
+    prefs.putBool("showWx", config.showWeather);
+    prefs.putBool("tempF", config.tempFahrenheit);
+    prefs.putBool("clk24", config.clock24);
+    prefs.putString("otaPass", config.otaPassword);
     prefs.putBool("configured", config.ssid.length() > 0);
     config.configured = config.ssid.length() > 0;
 }
@@ -1483,7 +1601,12 @@ static void handleRoot() {
     if (config.showLabelAltitude) body += F("checked");
     body += F(">Altitude</label><label class='check'><input type='checkbox' name='label_vrate' ");
     if (config.showLabelVerticalRate) body += F("checked");
-    body += F(">Vertical rate</label></section>");
+    body += F(">Vertical rate</label>");
+    body += F("<label class='field'>Aircraft tag size</label><div class='range-row'><input id='label-scale' name='label_scale' type='range' min='100' max='200' step='100' value='");
+    body += String(config.labelTextScalePercent);
+    body += F("' oninput=\"document.getElementById('label-scale-value').value=this.value==='200'?'Large':'Normal'\"><output id='label-scale-value'>");
+    body += config.labelTextScalePercent >= 150 ? F("Large") : F("Normal");
+    body += F("</output></div><small>Uses crisp 1x/2x bitmap sizes. Route pairs on tags stay one size larger. Intermediate scaling is not used because it blurs this font.</small></section>");
 
     body += F("<section><h2>Map</h2><label class='field'>Map background</label><select name='map'>");
     body += F("<option value='0'");
@@ -1499,12 +1622,28 @@ static void handleRoot() {
     body += htmlEscape(config.stadiaApiKey);
     body += F("'>");
     body += F("<small>The radar continues without a map if this is empty or the map request fails.</small></section>");
+    body += F("<section><h2>Clock and METAR</h2>");
+    body += F("<label class='check'><input type='checkbox' name='show_weather' ");
+    if (config.showWeather) body += F("checked");
+    body += F(">Show METAR in the right-hand footer</label>");
+    body += F("<label class='check'><input type='checkbox' name='temp_f' ");
+    if (config.tempFahrenheit) body += F("checked");
+    body += F(">Temperature in Fahrenheit</label>");
+    body += F("<label class='check'><input type='checkbox' name='clock_24' ");
+    if (config.clock24) body += F("checked");
+    body += F(">24-hour clock</label>");
+    body += F("<small>METAR is fetched from aviationweather.gov for the airport selected above. Manual ICAO uses that station; nearest-airport mode uses the closest selected field.</small></section>");
+    body += F("<section><h2>Firmware</h2>");
+    body += F("<label class='field'>OTA password (user: admin)</label>");
+    body += F("<input name='ota_password' type='password' autocomplete='new-password' placeholder='leave blank to keep current'>");
+    body += F("<p><a href='/firmware'>Open firmware update</a></p>");
+    body += F("<small>Upload the application .bin, not the merged flash image. The first dual-OTA install must be flashed over USB.</small></section>");
     body += F("<button class='save' type='submit'>Save and reboot</button></form>");
     body += F("<p><a href='/screenshot.bmp'>Download current screen BMP</a></p>");
-    body += F("<p><small>Tap radar: range preset. Tap an aircraft row: toggle its track. Long press: setup portal. Range is saved.</small></p>");
+    body += F("<p><small>Use + and - next to RANGE to change distance. Tap an aircraft on the map or in the list for details. Tap the detail card to clear. Long press: setup portal.</small></p>");
     body += F("<p><small>Current IP: ");
     body += WiFi.localIP().toString();
-    body += F(" AP: 192.168.4.1 Host: plane-radar.local</small></p>");
+    body += F(" AP: 192.168.4.1 Host: bigplane-radar.local</small></p>");
     body += F("<script>function updateAirportMode(){const manual=document.getElementById('airport-mode').value==='1';document.getElementById('airport-auto').style.display=manual?'none':'block';document.getElementById('airport-manual').style.display=manual?'block':'none'}"
               "function useBrowserLocation(){const status=document.getElementById('location-status');"
               "if(window.isSecureContext&&navigator.geolocation){status.textContent='Locating...';navigator.geolocation.getCurrentPosition(function(p){document.getElementById('lat').value=p.coords.latitude.toFixed(6);document.getElementById('lon').value=p.coords.longitude.toFixed(6);status.textContent='Browser location loaded. Save to apply.'},function(e){status.textContent='Location unavailable: '+e.message},{enableHighAccuracy:true,timeout:15000,maximumAge:60000});return}"
@@ -1599,6 +1738,10 @@ static void handleSave() {
     bool showLabelType = server.hasArg("label_type");
     bool showLabelAltitude = server.hasArg("label_altitude");
     bool showLabelVerticalRate = server.hasArg("label_vrate");
+    uint8_t labelTextScalePercent = clampLabelTextScalePercent(
+        server.hasArg("label_scale") ? server.arg("label_scale").toInt()
+                                     : config.labelTextScalePercent
+    );
     AircraftSymbolStyle aircraftSymbolStyle = server.arg("symbol_style").toInt() ==
             static_cast<int>(AircraftSymbolStyle::Classic)
         ? AircraftSymbolStyle::Classic
@@ -1614,6 +1757,14 @@ static void handleSave() {
         static_cast<int>(MAP_BRIGHTNESS_MIN),
         std::min(100, requestedMapBrightness)
     ));
+    bool showWeather = server.hasArg("show_weather");
+    bool tempFahrenheit = server.hasArg("temp_f");
+    bool clock24 = server.hasArg("clock_24");
+    String otaPassword = server.arg("ota_password");
+    otaPassword.trim();
+    if (otaPassword.length() == 0) {
+        otaPassword = config.otaPassword;
+    }
 
     lockState();
     config.ssid = ssid;
@@ -1630,10 +1781,15 @@ static void handleSave() {
     config.showLabelType = showLabelType;
     config.showLabelAltitude = showLabelAltitude;
     config.showLabelVerticalRate = showLabelVerticalRate;
+    config.labelTextScalePercent = labelTextScalePercent;
     config.aircraftSymbolStyle = aircraftSymbolStyle;
     config.mapProvider = mapProvider;
     config.stadiaApiKey = stadiaApiKey;
     config.mapBrightness = mapBrightness;
+    config.showWeather = showWeather;
+    config.tempFahrenheit = tempFahrenheit;
+    config.clock24 = clock24;
+    config.otaPassword = otaPassword;
     saveConfig();
     unlockState();
     server.send(200, "text/html", "<html><body><h1>Saved</h1><p>Rebooting...</p></body></html>");
@@ -1654,6 +1810,13 @@ static void startWebServer() {
     server.on("/screenshot", HTTP_GET, handleScreenshot);
     server.on("/screenshot.bmp", HTTP_GET, handleScreenshot);
     server.on("/save", HTTP_POST, handleSave);
+    OtaUpdate::attach(
+        server,
+        []() -> const char * { return config.otaPassword.c_str(); },
+        [](const char *title, const char *body) {
+            drawStatusScreen(title, body);
+        }
+    );
     server.onNotFound(handleNotFound);
     server.begin();
     webServerStarted = true;
@@ -1670,12 +1833,12 @@ static void startPortal() {
         return;
     }
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP("PlaneRadar-Setup");
+    WiFi.softAP(kSetupApName);
     startWebServer();
-    if (!mdnsStarted && MDNS.begin("plane-radar")) {
+    if (!mdnsStarted && MDNS.begin(kMdnsHostname)) {
         mdnsStarted = true;
     }
-    drawStatusScreen("PLANE RADAR SETUP", "Connect to Wi-Fi AP: PlaneRadar-Setup\nOpen http://192.168.4.1\nSet Wi-Fi and radar location.");
+    drawStatusScreen("BIG PLANE RADAR SETUP", "Connect to Wi-Fi AP: BigPlaneRadar-Setup\nOpen http://192.168.4.1\nSet Wi-Fi and radar location.");
     setStatus("SETUP PORTAL");
 }
 
@@ -1756,7 +1919,7 @@ static bool connectWifiOnce(uint32_t timeoutMs) {
         setBootStageDetails(BOOT_WIFI, ssidLine, modeLine, waitLine, statusLine);
         return false;
     }
-    if (!mdnsStarted && MDNS.begin("plane-radar")) {
+    if (!mdnsStarted && MDNS.begin(kMdnsHostname)) {
         mdnsStarted = true;
     }
     if (!portalActive) {
@@ -1956,6 +2119,27 @@ static bool copyAirportIata(const JsonObject &airport, char *out, size_t outLen)
            copyIataCode(airport, "iataCode", out, outLen);
 }
 
+static bool copyIcaoCode(const JsonObject &obj, const char *key, char *out, size_t outLen) {
+    if (outLen < 5) return false;
+    out[0] = '\0';
+    if (!obj[key].is<const char *>()) return false;
+    const char *value = obj[key].as<const char *>();
+    size_t len = 0;
+    for (size_t i = 0; value[i] != '\0' && len < 4; i++) {
+        unsigned char c = static_cast<unsigned char>(value[i]);
+        if (!isalnum(c)) continue;
+        out[len++] = static_cast<char>(toupper(c));
+    }
+    out[len] = '\0';
+    return len >= 3;
+}
+
+static bool copyAirportIcao(const JsonObject &airport, char *out, size_t outLen) {
+    return copyIcaoCode(airport, "icao_code", out, outLen) ||
+           copyIcaoCode(airport, "icao", out, outLen) ||
+           copyIcaoCode(airport, "ident", out, outLen);
+}
+
 static char latinCodepointToAscii(uint32_t codepoint) {
     if (codepoint >= 0x00C0 && codepoint <= 0x00C5) return 'A';
     if (codepoint >= 0x00E0 && codepoint <= 0x00E5) return 'a';
@@ -2141,6 +2325,249 @@ static void syncRouteCacheFromAircraft(uint32_t now) {
     pruneRouteCache(now);
 }
 
+static TypeNameCacheEntry *findTypeCacheEntry(const char *typeCode) {
+    if (typeCode == nullptr || typeCode[0] == '\0') {
+        return nullptr;
+    }
+    for (size_t i = 0; i < MAX_TYPE_CACHE; i++) {
+        if (typeNameCache[i].active && strcmp(typeNameCache[i].typeCode, typeCode) == 0) {
+            return &typeNameCache[i];
+        }
+    }
+    return nullptr;
+}
+
+static void touchTypeCacheEntry(const char *typeCode, uint32_t now) {
+    if (typeCode == nullptr || typeCode[0] == '\0') {
+        return;
+    }
+    TypeNameCacheEntry *entry = findTypeCacheEntry(typeCode);
+    if (entry == nullptr) {
+        for (size_t i = 0; i < MAX_TYPE_CACHE; i++) {
+            if (!typeNameCache[i].active) {
+                entry = &typeNameCache[i];
+                *entry = TypeNameCacheEntry();
+                strlcpy(entry->typeCode, typeCode, sizeof(entry->typeCode));
+                entry->active = true;
+                break;
+            }
+        }
+    }
+    if (entry == nullptr) {
+        return;
+    }
+}
+
+static void syncTypeCacheFromAircraft(uint32_t now) {
+    for (size_t i = 0; i < aircraftCount; i++) {
+        touchTypeCacheEntry(aircraft[i].type, now);
+    }
+}
+
+static void copyPrintableName(const char *value, char *out, size_t outLen) {
+    if (outLen == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (value == nullptr) {
+        return;
+    }
+    size_t written = 0;
+    bool previousSpace = true;
+    for (size_t i = 0; value[i] != '\0' && written + 1 < outLen; ++i) {
+        unsigned char ch = static_cast<unsigned char>(value[i]);
+        if (ch < 32 || ch > 126) {
+            continue;
+        }
+        if (ch == ' ') {
+            if (previousSpace) {
+                continue;
+            }
+            previousSpace = true;
+        } else {
+            previousSpace = false;
+        }
+        out[written++] = static_cast<char>(ch);
+    }
+    while (written > 0 && out[written - 1] == ' ') {
+        --written;
+    }
+    out[written] = '\0';
+}
+
+static bool readDecodedHttpBody(HTTPClient &http, String &payload);
+
+static bool lookupTypeNameForHex(const char *hex, char *out, size_t outLen) {
+    if (hex == nullptr || hex[0] == '\0' || outLen == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    String url = "https://api.adsbdb.com/v0/aircraft/";
+    url += hex;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+        return false;
+    }
+    http.setTimeout(ROUTE_HTTP_TIMEOUT_MS);
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        http.end();
+        return false;
+    }
+    String payload;
+    if (!readDecodedHttpBody(http, payload)) {
+        http.end();
+        return false;
+    }
+    http.end();
+
+    JsonDocument filter;
+    filter["response"]["aircraft"]["type"] = true;
+    filter["response"]["aircraft"]["icao_type"] = true;
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) {
+        return false;
+    }
+    JsonObject aircraftObj = doc["response"]["aircraft"].as<JsonObject>();
+    if (aircraftObj.isNull()) {
+        return false;
+    }
+    const char *detailed = aircraftObj["type"].is<const char *>()
+        ? aircraftObj["type"].as<const char *>()
+        : nullptr;
+    copyPrintableName(detailed, out, outLen);
+    return out[0] != '\0';
+}
+
+static bool serviceTypeLookup() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+    uint32_t now = millis();
+    if (now - lastTypeLookupMs < ROUTE_LOOKUP_INTERVAL_MS) {
+        return false;
+    }
+
+    char typeCode[8] = {};
+    char hex[7] = {};
+    lockState();
+    auto pickAircraftForType = [&](const char *wantedType) -> bool {
+        for (size_t i = 0; i < aircraftCount; i++) {
+            if (strcmp(aircraft[i].type, wantedType) != 0) {
+                continue;
+            }
+            if (aircraft[i].hex[0] == '\0') {
+                continue;
+            }
+            strlcpy(hex, aircraft[i].hex, sizeof(hex));
+            return true;
+        }
+        return false;
+    };
+
+    if (selectedAircraftHex[0] != '\0') {
+        for (size_t i = 0; i < aircraftCount; i++) {
+            if (strcmp(aircraft[i].hex, selectedAircraftHex) != 0) {
+                continue;
+            }
+            TypeNameCacheEntry *selectedType = findTypeCacheEntry(aircraft[i].type);
+            if (selectedType != nullptr && !selectedType->hasName &&
+                (!selectedType->lookupDone ||
+                 now - selectedType->lastLookupMs >= ROUTE_LOOKUP_RETRY_MS) &&
+                aircraft[i].hex[0] != '\0') {
+                strlcpy(typeCode, aircraft[i].type, sizeof(typeCode));
+                strlcpy(hex, aircraft[i].hex, sizeof(hex));
+            }
+            break;
+        }
+    }
+    if (typeCode[0] == '\0') {
+        for (size_t i = 0; i < MAX_TYPE_CACHE; i++) {
+            TypeNameCacheEntry &entry = typeNameCache[i];
+            if (!entry.active || entry.hasName) {
+                continue;
+            }
+            if (entry.lookupDone && now - entry.lastLookupMs < ROUTE_LOOKUP_RETRY_MS) {
+                continue;
+            }
+            if (!pickAircraftForType(entry.typeCode)) {
+                continue;
+            }
+            strlcpy(typeCode, entry.typeCode, sizeof(typeCode));
+            break;
+        }
+    }
+    if (typeCode[0] == '\0' || hex[0] == '\0') {
+        unlockState();
+        return false;
+    }
+    TypeNameCacheEntry *queued = findTypeCacheEntry(typeCode);
+    if (queued != nullptr) {
+        queued->lookupDone = true;
+        queued->lastLookupMs = now;
+    }
+    lastTypeLookupMs = now;
+    unlockState();
+
+    char fullName[TYPE_NAME_MAX_LEN] = {};
+    bool ok = lookupTypeNameForHex(hex, fullName, sizeof(fullName));
+    lockState();
+    TypeNameCacheEntry *entry = findTypeCacheEntry(typeCode);
+    if (entry != nullptr && ok) {
+        strlcpy(entry->fullName, fullName, sizeof(entry->fullName));
+        entry->hasName = true;
+        networkDataDirty = true;
+    }
+    unlockState();
+    return ok;
+}
+
+/**
+ * HTTPClient::writeToStream() unwraps Content-Length and Transfer-Encoding:
+ * chunked. Reading getStream() directly does not, so Cloudflare chunk-size
+ * lines (and a trailing "0") made ArduinoJson report InvalidInput.
+ */
+class DecodedBodySink : public Stream {
+ public:
+    explicit DecodedBodySink(String &dest) : dest_(dest) {}
+
+    size_t write(uint8_t c) override {
+        return dest_.concat(static_cast<char>(c)) ? 1 : 0;
+    }
+
+    size_t write(const uint8_t *buffer, size_t size) override {
+        if (buffer == nullptr || size == 0) {
+            return 0;
+        }
+        return dest_.concat(reinterpret_cast<const char *>(buffer),
+                            static_cast<unsigned>(size))
+                   ? size
+                   : 0;
+    }
+
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+    void flush() override {}
+
+ private:
+    String &dest_;
+};
+
+static bool readDecodedHttpBody(HTTPClient &http, String &payload) {
+    payload = "";
+    const int contentLength = http.getSize();
+    if (contentLength > 0) {
+        payload.reserve(static_cast<unsigned>(contentLength + 1));
+    }
+
+    DecodedBodySink sink(payload);
+    return http.writeToStream(&sink) > 0 && payload.length() > 0;
+}
+
 static bool lookupRouteForCallsign(RouteCacheEntry &entry) {
     String url = "https://api.adsbdb.com/v0/callsign/";
     url += entry.callsign;
@@ -2158,24 +2585,36 @@ static bool lookupRouteForCallsign(RouteCacheEntry &entry) {
         return false;
     }
 
+    String payload;
+    if (!readDecodedHttpBody(http, payload)) {
+        http.end();
+        return false;
+    }
+    http.end();
+
     JsonDocument filter;
     filter["response"]["flightroute"]["origin"]["iata_code"] = true;
     filter["response"]["flightroute"]["origin"]["iata"] = true;
     filter["response"]["flightroute"]["origin"]["iataCode"] = true;
+    filter["response"]["flightroute"]["origin"]["icao_code"] = true;
+    filter["response"]["flightroute"]["origin"]["icao"] = true;
+    filter["response"]["flightroute"]["origin"]["ident"] = true;
     filter["response"]["flightroute"]["origin"]["municipality"] = true;
     filter["response"]["flightroute"]["origin"]["name"] = true;
     filter["response"]["flightroute"]["destination"]["iata_code"] = true;
     filter["response"]["flightroute"]["destination"]["iata"] = true;
     filter["response"]["flightroute"]["destination"]["iataCode"] = true;
+    filter["response"]["flightroute"]["destination"]["icao_code"] = true;
+    filter["response"]["flightroute"]["destination"]["icao"] = true;
+    filter["response"]["flightroute"]["destination"]["ident"] = true;
     filter["response"]["flightroute"]["destination"]["municipality"] = true;
     filter["response"]["flightroute"]["destination"]["name"] = true;
     JsonDocument doc;
     DeserializationError err = deserializeJson(
         doc,
-        http.getStream(),
+        payload,
         DeserializationOption::Filter(filter)
     );
-    http.end();
     if (err) {
         return false;
     }
@@ -2187,15 +2626,23 @@ static bool lookupRouteForCallsign(RouteCacheEntry &entry) {
 
     char origin[4] = {};
     char destination[4] = {};
+    char originIcao[5] = {};
+    char destinationIcao[5] = {};
     JsonObject originAirport = route["origin"].as<JsonObject>();
     JsonObject destinationAirport = route["destination"].as<JsonObject>();
-    if (!copyAirportIata(originAirport, origin, sizeof(origin)) ||
-        !copyAirportIata(destinationAirport, destination, sizeof(destination))) {
+    copyAirportIata(originAirport, origin, sizeof(origin));
+    copyAirportIata(destinationAirport, destination, sizeof(destination));
+    copyAirportIcao(originAirport, originIcao, sizeof(originIcao));
+    copyAirportIcao(destinationAirport, destinationIcao, sizeof(destinationIcao));
+    if ((origin[0] == '\0' && originIcao[0] == '\0') ||
+        (destination[0] == '\0' && destinationIcao[0] == '\0')) {
         return false;
     }
 
     strlcpy(entry.originIata, origin, sizeof(entry.originIata));
     strlcpy(entry.destinationIata, destination, sizeof(entry.destinationIata));
+    strlcpy(entry.originIcao, originIcao, sizeof(entry.originIcao));
+    strlcpy(entry.destinationIcao, destinationIcao, sizeof(entry.destinationIcao));
     copyRouteCity(originAirport, entry.originCity, sizeof(entry.originCity));
     copyRouteCity(destinationAirport, entry.destinationCity, sizeof(entry.destinationCity));
     entry.hasRoute = true;
@@ -2247,6 +2694,8 @@ static bool serviceRouteLookup() {
         if (ok) {
             strlcpy(entry->originIata, lookupEntry.originIata, sizeof(entry->originIata));
             strlcpy(entry->destinationIata, lookupEntry.destinationIata, sizeof(entry->destinationIata));
+            strlcpy(entry->originIcao, lookupEntry.originIcao, sizeof(entry->originIcao));
+            strlcpy(entry->destinationIcao, lookupEntry.destinationIcao, sizeof(entry->destinationIcao));
             strlcpy(entry->originCity, lookupEntry.originCity, sizeof(entry->originCity));
             strlcpy(entry->destinationCity, lookupEntry.destinationCity, sizeof(entry->destinationCity));
             rememberAirportCityLocked(entry->originIata, entry->originCity, now);
@@ -2294,20 +2743,27 @@ static const RouteCacheEntry *findRouteCacheEntryIn(
 static void formatRoutePlace(
     const char *city,
     const char *iata,
+    const char *icao,
     size_t keepChars,
     char *out,
     size_t outLen
 ) {
     if (outLen == 0) return;
     out[0] = '\0';
+    const char *code = (icao != nullptr && icao[0] != '\0') ? icao
+        : ((iata != nullptr && iata[0] != '\0') ? iata : "");
     if (city == nullptr || city[0] == '\0') {
-        strlcpy(out, iata != nullptr ? iata : "", outLen);
+        strlcpy(out, code, outLen);
         return;
     }
 
     size_t cityLen = strlen(city);
     if (keepChars >= cityLen) {
-        strlcpy(out, city, outLen);
+        if (code[0] != '\0') {
+            snprintf(out, outLen, "%s %s", city, code);
+        } else {
+            strlcpy(out, city, outLen);
+        }
         return;
     }
 
@@ -2316,12 +2772,16 @@ static void formatRoutePlace(
         copyLen--;
     }
     if (copyLen == 0) {
-        strlcpy(out, iata != nullptr ? iata : "", outLen);
+        strlcpy(out, code, outLen);
         return;
     }
     memcpy(out, city, copyLen);
     out[copyLen] = '\0';
     strlcat(out, "...", outLen);
+    if (code[0] != '\0') {
+        strlcat(out, " ", outLen);
+        strlcat(out, code, outLen);
+    }
 }
 
 static bool canShortenRoutePlace(size_t cityLen, size_t keepChars) {
@@ -2366,13 +2826,14 @@ static bool routeLabelForCallsign(
     size_t destinationLen = strlen(entry->destinationCity);
     size_t originKeep = originLen;
     size_t destinationKeep = destinationLen;
-    char origin[ROUTE_CITY_MAX_LEN + 4];
-    char destination[ROUTE_CITY_MAX_LEN + 4];
+    char origin[ROUTE_CITY_MAX_LEN + 8];
+    char destination[ROUTE_CITY_MAX_LEN + 8];
 
     for (size_t attempt = 0; attempt < ROUTE_CITY_MAX_LEN * 2; attempt++) {
         formatRoutePlace(
             entry->originCity,
             entry->originIata,
+            entry->originIcao,
             originKeep,
             origin,
             sizeof(origin)
@@ -2380,6 +2841,7 @@ static bool routeLabelForCallsign(
         formatRoutePlace(
             entry->destinationCity,
             entry->destinationIata,
+            entry->destinationIcao,
             destinationKeep,
             destination,
             sizeof(destination)
@@ -2400,8 +2862,57 @@ static bool routeLabelForCallsign(
         }
     }
 
-    snprintf(out, outLen, "%s - %s", entry->originIata, entry->destinationIata);
+    if (entry->originIata[0] != '\0' && entry->destinationIata[0] != '\0') {
+        snprintf(out, outLen, "%s - %s", entry->originIata, entry->destinationIata);
+    } else {
+        snprintf(out, outLen, "%s - %s", entry->originIcao, entry->destinationIcao);
+    }
     return out[0] != '\0';
+}
+
+static bool routePairLabel(
+    const RouteCacheEntry *entries,
+    size_t entryCount,
+    const char *callsign,
+    char *out,
+    size_t outLen
+) {
+    if (outLen == 0) return false;
+    out[0] = '\0';
+    char normalized[10];
+    if (!normalizeCallsign(callsign, normalized, sizeof(normalized))) {
+        return false;
+    }
+    const RouteCacheEntry *entry = findRouteCacheEntryIn(entries, entryCount, normalized);
+    if (entry == nullptr || !entry->hasRoute) {
+        return false;
+    }
+    if (entry->originIata[0] != '\0' && entry->destinationIata[0] != '\0') {
+        snprintf(out, outLen, "%s-%s", entry->originIata, entry->destinationIata);
+        return true;
+    }
+    if (entry->originIcao[0] != '\0' && entry->destinationIcao[0] != '\0') {
+        snprintf(out, outLen, "%s-%s", entry->originIcao, entry->destinationIcao);
+        return true;
+    }
+    return false;
+}
+
+static const char *typeNameForCode(
+    const TypeNameCacheEntry *entries,
+    size_t entryCount,
+    const char *typeCode
+) {
+    if (typeCode == nullptr || typeCode[0] == '\0') {
+        return nullptr;
+    }
+    for (size_t i = 0; i < entryCount; i++) {
+        if (entries[i].active && entries[i].hasName &&
+            strcmp(entries[i].typeCode, typeCode) == 0) {
+            return entries[i].fullName;
+        }
+    }
+    return nullptr;
 }
 
 static void formatAltitude(const JsonObject &plane, char *out, size_t outLen) {
@@ -2540,7 +3051,7 @@ static bool fetchAdsb() {
     const char *fields[] = {
         "lat", "lon", "track", "true_heading", "mag_heading", "dir",
         "gs", "tas", "ias", "baro_rate", "geom_rate", "flight", "hex",
-        "t", "category", "squawk", "alt_baro", "alt_geom"
+        "t", "r", "category", "squawk", "alt_baro", "alt_geom"
     };
     for (const char *field : fields) {
         filter["ac"][0][field] = true;
@@ -2553,13 +3064,21 @@ static bool fetchAdsb() {
         snprintf(responseLine, sizeof(responseLine), "HTTP %d / PARSING JSON STREAM", code);
     }
     setBootStageDetails(BOOT_DATA, endpointLine, centerLine, radiusLine, responseLine);
+    String payload;
+    if (!readDecodedHttpBody(http, payload)) {
+        http.end();
+        strlcpy(responseLine, "EMPTY OR CHUNKED BODY FAILED", sizeof(responseLine));
+        setBootStageDetails(BOOT_DATA, endpointLine, centerLine, radiusLine, responseLine);
+        setLastFetchText("EMPTY RESPONSE");
+        return false;
+    }
+    http.end();
     JsonDocument doc;
     DeserializationError err = deserializeJson(
         doc,
-        http.getStream(),
+        payload,
         DeserializationOption::Filter(filter)
     );
-    http.end();
     if (err) {
         snprintf(responseLine, sizeof(responseLine), "JSON ERROR / %s", err.c_str());
         setBootStageDetails(BOOT_DATA, endpointLine, centerLine, radiusLine, responseLine);
@@ -2599,8 +3118,15 @@ static bool fetchAdsb() {
                 strlcpy(dst.callsign, dst.hex, sizeof(dst.callsign));
             }
             copyJsonStringTrimmed(plane, "t", dst.type, sizeof(dst.type));
+            copyJsonStringTrimmed(plane, "r", dst.registration, sizeof(dst.registration));
             copyJsonStringTrimmed(plane, "category", dst.category, sizeof(dst.category));
             copySquawkCode(plane, dst.squawk, sizeof(dst.squawk));
+            dst.altitudeFt = -1.0e9f;
+            float altitudeFt = 0;
+            if (readJsonFloat(plane, "alt_baro", altitudeFt) ||
+                readJsonFloat(plane, "alt_geom", altitudeFt)) {
+                dst.altitudeFt = altitudeFt;
+            }
             formatAltitude(plane, dst.alt, sizeof(dst.alt));
             formatVerticalRate(dst.verticalRateFpm, dst.vsi, sizeof(dst.vsi));
             fetchedCount++;
@@ -2616,6 +3142,7 @@ static bool fetchAdsb() {
     aircraftCount = fetchedCount;
     updateAircraftTracksLocked(fetchedAircraft, fetchedCount, fetchNow);
     syncRouteCacheFromAircraft(fetchNow);
+    syncTypeCacheFromAircraft(fetchNow);
     lastFetchText = fetchStatus;
     networkDataDirty = true;
     unlockState();
@@ -2800,6 +3327,55 @@ static void drawDashedTrackLine(
     }
 }
 
+static int trajectoryLengthPx(float gsKnots) {
+    if (gsKnots <= 1.0f) {
+        return 0;
+    }
+    constexpr float kmPerKnotHorizon = KM_PER_NM * 60.0f / 3600.0f;
+    constexpr float refOuterKm = 13.3f;
+    constexpr float lengthScale = 1.5f / 5.0f;
+    float px = gsKnots * kmPerKnotHorizon * static_cast<float>(RADAR_RADIUS) /
+        refOuterKm * lengthScale;
+    int len = static_cast<int>(lroundf(px));
+    return len < 6 ? 6 : len;
+}
+
+template <typename Gfx>
+static void drawAircraftTrajectory(
+    Gfx &g,
+    const Aircraft &item,
+    int x,
+    int y,
+    bool selected
+) {
+    int len = trajectoryLengthPx(item.gsKnots);
+    if (len <= 0) {
+        return;
+    }
+    float heading = item.hasTrack ? item.trackDeg : item.noseDeg;
+    float rad = heading * DEG_TO_RAD;
+    float s = sinf(rad);
+    float c = cosf(rad);
+    int startX = x + static_cast<int>(lroundf(s * 10.0f));
+    int startY = y - static_cast<int>(lroundf(c * 10.0f));
+    int endX = startX + static_cast<int>(lroundf(s * static_cast<float>(len)));
+    int endY = startY - static_cast<int>(lroundf(c * static_cast<float>(len)));
+    if (!clipTrackLineToMapViewport(startX, startY, endX, endY)) {
+        return;
+    }
+    if (abs(endX - startX) + abs(endY - startY) < 2) {
+        return;
+    }
+    g.drawWideLine(
+        startX,
+        startY,
+        endX,
+        endY,
+        selected ? 1.8f : 1.0f,
+        colorTrajectory
+    );
+}
+
 static const Aircraft *findAircraftByHex(
     const Aircraft *items,
     size_t itemCount,
@@ -2915,7 +3491,7 @@ static uint8_t planeSizeClass(const Aircraft &item) {
 }
 
 template <typename Gfx>
-static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClass) {
+static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClass, uint16_t color) {
     int tipLen = 12;
     int tailLen = 8;
     int wingLen = 6;
@@ -2938,11 +3514,11 @@ static void drawPlane(Gfx &g, int cx, int cy, float headingDeg, uint8_t sizeClas
     int tailY = cy + lroundf(c * tailLen);
     int wingX = lroundf(c * wingLen);
     int wingY = lroundf(s * wingLen);
-    g.fillTriangle(tipX, tipY, tailX + wingX, tailY + wingY, tailX - wingX, tailY - wingY, colorPlane);
+    g.fillTriangle(tipX, tipY, tailX + wingX, tailY + wingY, tailX - wingX, tailY - wingY, color);
 }
 
 template <typename Gfx>
-static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
+static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy, uint16_t color) {
     if (config.aircraftSymbolStyle == AircraftSymbolStyle::DetailedIcons) {
         AircraftIcons::draw(
             g,
@@ -2951,7 +3527,7 @@ static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
             item.noseDeg,
             cx,
             cy,
-            colorWarn
+            color
         );
         return;
     }
@@ -2966,20 +3542,20 @@ static void drawAircraftSymbol(Gfx &g, const Aircraft &item, int cx, int cy) {
         g.drawWideLine(
             cx - rotor1X, cy - rotor1Y,
             cx + rotor1X, cy + rotor1Y,
-            2.0f, colorPlane
+            2.0f, color
         );
         g.drawWideLine(
             cx - rotor2X, cy - rotor2Y,
             cx + rotor2X, cy + rotor2Y,
-            2.0f, colorPlane
+            2.0f, color
         );
 
         int tailX = cx - lroundf(s * 7);
         int tailY = cy + lroundf(c * 7);
-        g.drawWideLine(cx, cy, tailX, tailY, 2.0f, colorPlane);
+        g.drawWideLine(cx, cy, tailX, tailY, 2.0f, color);
         return;
     }
-    drawPlane(g, cx, cy, item.noseDeg, planeSizeClass(item));
+    drawPlane(g, cx, cy, item.noseDeg, planeSizeClass(item), color);
 }
 
 static uint32_t aircraftLabelId(const Aircraft &item) {
@@ -3037,10 +3613,12 @@ static size_t prepareRadarLabels(
     Gfx &g,
     const Aircraft *items,
     size_t itemCount,
-    const char *selectedHex
+    const char *selectedHex,
+    int labelScalePercent,
+    const RouteCacheEntry *routes,
+    size_t routeCount
 ) {
     size_t labelCount = 0;
-    g.setTextSize(1);
     for (size_t aircraftIndex = 0;
          aircraftIndex < itemCount && labelCount < MAX_AIRCRAFT;
          aircraftIndex++) {
@@ -3052,22 +3630,51 @@ static size_t prepareRadarLabels(
 
         RadarLabelRender &label = radarLabels[labelCount];
         label = RadarLabelRender();
+        label.aircraftIndex = aircraftIndex;
         label.mustShow = squawkAlertLabel(item.squawk) != nullptr ||
             (selectedHex != nullptr && selectedHex[0] != '\0' &&
              strcmp(item.hex, selectedHex) == 0);
 
-        auto appendLine = [&](const char *text, uint16_t color) {
+        auto appendLine = [&](const char *text, uint16_t color, uint8_t textSize) {
             if (text == nullptr || text[0] == '\0' || label.lineCount >= 3) return;
+            g.setTextSize(textSize);
             RadarLabelLine &line = label.lines[label.lineCount++];
             strlcpy(line.text, text, sizeof(line.text));
             line.color = color;
+            line.textSize = textSize;
             line.width = g.textWidth(line.text);
+            line.height = g.textHeight();
+            line.advance = g.textLineAdvance();
             label.width = std::max(label.width, line.width);
         };
 
+        const uint8_t baseSize = labelBaseTextSize(labelScalePercent);
+        const uint8_t routeSize = static_cast<uint8_t>(baseSize + 1);
+
+        char routePair[16] = {};
+        const bool hasRoute = routePairLabel(
+            routes, routeCount, item.callsign, routePair, sizeof(routePair));
         const char *callsign = item.callsign[0] ? item.callsign : "????";
-        if (config.showLabelCallsign) appendLine(callsign, colorText);
-        if (config.showLabelType) appendLine(item.type, colorDim);
+
+        if (hasRoute) {
+            appendLine(routePair, colorText, routeSize);
+        } else if (config.showLabelCallsign) {
+            appendLine(callsign, colorText, routeSize);
+        }
+
+        if (hasRoute) {
+            char identity[40] = {};
+            if (config.showLabelCallsign && config.showLabelType && item.type[0] != '\0') {
+                snprintf(identity, sizeof(identity), "%s %s", callsign, item.type);
+                appendLine(identity, colorRunway, baseSize);
+            } else if (config.showLabelCallsign) {
+                appendLine(callsign, colorRunway, baseSize);
+            } else if (config.showLabelType) {
+                appendLine(item.type, colorRunway, baseSize);
+            }
+        } else if (config.showLabelType) {
+            appendLine(item.type, colorRunway, baseSize);
+        }
 
         char altitudeLine[32] = {};
         if (config.showLabelAltitude && item.alt[0] != '\0') {
@@ -3079,13 +3686,16 @@ static size_t prepareRadarLabels(
             }
             strlcat(altitudeLine, item.vsi, sizeof(altitudeLine));
         }
-        appendLine(altitudeLine, colorWarn);
+        appendLine(altitudeLine, colorWarn, baseSize);
         if (label.lineCount == 0) continue;
 
         label.width += AIRCRAFT_LABEL_PADDING * 2;
-        label.height = AIRCRAFT_LABEL_LINE_HEIGHT +
-            static_cast<int>(label.lineCount - 1) * AIRCRAFT_LABEL_LINE_ADVANCE +
-            AIRCRAFT_LABEL_PADDING * 2;
+        int height = AIRCRAFT_LABEL_PADDING * 2;
+        for (size_t lineIndex = 0; lineIndex < label.lineCount; lineIndex++) {
+            const RadarLabelLine &line = label.lines[lineIndex];
+            height += (lineIndex + 1 == label.lineCount) ? line.height : line.advance;
+        }
+        label.height = height;
 
         RadarLabels::LabelLayoutInput &input = labelLayoutInputs[labelCount];
         input = RadarLabels::LabelLayoutInput();
@@ -3178,6 +3788,14 @@ static void appendTokenIfFits(
 }
 
 template <typename Gfx>
+static void truncateToWidth(Gfx &g, char *line, int maxWidth) {
+    if (line == nullptr) return;
+    while (line[0] != '\0' && g.textWidth(line) > maxWidth) {
+        line[strlen(line) - 1] = '\0';
+    }
+}
+
+template <typename Gfx>
 static void drawAircraftList(
     Gfx &g,
     const Aircraft *items,
@@ -3192,6 +3810,32 @@ static void drawAircraftList(
     visibleListRowCount = 0;
     memset(visibleListAircraftHex, 0, sizeof(visibleListAircraftHex));
 
+    rangeMinusHit = {
+        PANEL_X + PANEL_PAD,
+        10,
+        RANGE_BUTTON_W,
+        RANGE_BUTTON_H
+    };
+    rangePlusHit = {
+        rangeMinusHit.x + RANGE_BUTTON_W + RANGE_BUTTON_GAP,
+        10,
+        RANGE_BUTTON_W,
+        RANGE_BUTTON_H
+    };
+    auto drawRangeButton = [&](const TouchRect &rect, const char *label) {
+        g.fillRect(rect.x, rect.y, rect.w, rect.h, colorSelectedRow);
+        g.drawWideLine(rect.x, rect.y, rect.x + rect.w, rect.y, 1.0f, colorGrid);
+        g.drawWideLine(rect.x, rect.y + rect.h - 1, rect.x + rect.w, rect.y + rect.h - 1, 1.0f, colorGrid);
+        g.drawWideLine(rect.x, rect.y, rect.x, rect.y + rect.h, 1.0f, colorGrid);
+        g.drawWideLine(rect.x + rect.w - 1, rect.y, rect.x + rect.w - 1, rect.y + rect.h, 1.0f, colorGrid);
+        g.setTextDatum(textdatum_t::middle_center);
+        g.setTextSize(2);
+        g.setTextColor(colorText, colorSelectedRow);
+        g.drawString(label, rect.x + rect.w / 2, rect.y + rect.h / 2);
+    };
+    drawRangeButton(rangeMinusHit, "-");
+    drawRangeButton(rangePlusHit, "+");
+
     g.setTextDatum(textdatum_t::top_right);
     g.setTextSize(2);
     g.setTextColor(colorDim, colorBg);
@@ -3200,7 +3844,8 @@ static void drawAircraftList(
     g.drawString(rangeTitle, PANEL_RIGHT, 10);
 
     int textWidth = PANEL_RIGHT - PANEL_TEXT_X;
-    int maxRows = static_cast<int>(panelVisibleRows);
+    bool selectedList = selectedHex != nullptr && selectedHex[0] != '\0';
+    int maxRows = static_cast<int>(listRowCapacity(selectedList));
     int drawn = 0;
     for (int idx = static_cast<int>(itemCount) - 1; idx >= 0 && drawn < maxRows; idx--) {
         const Aircraft &item = items[idx];
@@ -3219,10 +3864,15 @@ static void drawAircraftList(
                 PANEL_ROW_H - 1,
                 rowBg
             );
-            g.fillRect(PANEL_X + 2, rowY - 2, 3, PANEL_ROW_H - 1, colorWarn);
+            g.fillRect(PANEL_X + 2, rowY - 2, 3, PANEL_ROW_H - 1, colorSelected);
         }
 
-        drawAircraftSymbol(g, item, iconX, iconY);
+        uint16_t iconColor = selected
+            ? colorSelected
+            : (config.aircraftSymbolStyle == AircraftSymbolStyle::DetailedIcons
+                ? colorWarn
+                : colorPlane);
+        drawAircraftSymbol(g, item, iconX, iconY, iconColor);
 
         g.setTextDatum(textdatum_t::top_left);
         g.setTextSize(2);
@@ -3250,7 +3900,7 @@ static void drawAircraftList(
             g.setTextColor(colorWarn, rowBg);
             g.drawString(alert, PANEL_TEXT_X, rowY + 32);
         } else {
-            char route[(ROUTE_CITY_MAX_LEN * 2) + 8];
+            char route[(ROUTE_CITY_MAX_LEN * 2) + 16];
             if (routeLabelForCallsign(
                     g, routes, routeCount, item.callsign, textWidth, route, sizeof(route))) {
                 g.setTextColor(colorRunway, rowBg);
@@ -3274,6 +3924,175 @@ static void drawAircraftList(
         g.setTextColor(colorDim, colorBg);
         g.drawString(WiFi.status() == WL_CONNECTED ? "NO AIRCRAFT" : emptyStatus, PANEL_TEXT_X, PANEL_LIST_TOP);
     }
+}
+
+template <typename Gfx>
+static void drawWeatherClockFooter(Gfx &g, bool showMetar, bool fahrenheit, bool clock24) {
+    int top = panelFooterTopY();
+    g.fillRect(PANEL_X + 1, top, SCREEN_W - PANEL_X - 1, PANEL_FOOTER_H, colorBg);
+    g.drawWideLine(PANEL_X + PANEL_PAD, top + 2, PANEL_RIGHT, top + 2, 1.0f, colorGrid);
+
+    const int leftX = PANEL_X + PANEL_PAD;
+    const int metarWidth = PANEL_RIGHT - leftX;
+    char timeText[12];
+    char dateText[12];
+    char icaoText[8];
+    WeatherTime::formatTime(timeText, sizeof(timeText), clock24);
+    WeatherTime::stationIcao(icaoText, sizeof(icaoText));
+    if (!(showMetar && WeatherTime::formatMetarObsTime(dateText, sizeof(dateText)))) {
+        WeatherTime::formatDate(dateText, sizeof(dateText));
+    }
+
+    g.setTextSize(2);
+    g.setTextColor(colorText, colorBg);
+    g.setTextDatum(textdatum_t::top_left);
+    g.drawString(timeText, leftX, top + 8);
+    g.setTextDatum(textdatum_t::top_right);
+    g.drawString(dateText, PANEL_RIGHT, top + 8);
+    if (showMetar && icaoText[0] != '\0') {
+        g.setTextDatum(textdatum_t::middle_center);
+        g.drawString(icaoText, (leftX + PANEL_RIGHT) / 2, top + 15);
+    }
+
+    g.setTextDatum(textdatum_t::top_left);
+    g.setTextSize(2);
+    g.setTextColor(colorDim, colorBg);
+    if (showMetar) {
+        char metar[160];
+        WeatherTime::formatMetarBody(metar, sizeof(metar), fahrenheit);
+        int lineY = top + 32;
+        int maxLines = 3;
+        const char *cursor = metar;
+        for (int line = 0; line < maxLines && cursor[0] != '\0'; line++) {
+            char wrapped[96] = {};
+            size_t used = 0;
+            while (cursor[0] != '\0') {
+                while (cursor[0] == ' ') {
+                    ++cursor;
+                }
+                if (cursor[0] == '\0') {
+                    break;
+                }
+                const char *token = cursor;
+                while (cursor[0] != '\0' && cursor[0] != ' ') {
+                    ++cursor;
+                }
+                size_t tokenLen = static_cast<size_t>(cursor - token);
+                char candidate[96];
+                strlcpy(candidate, wrapped, sizeof(candidate));
+                if (used > 0) {
+                    strlcat(candidate, " ", sizeof(candidate));
+                }
+                char tokenText[48];
+                size_t copyLen = tokenLen < sizeof(tokenText) - 1 ? tokenLen : sizeof(tokenText) - 1;
+                memcpy(tokenText, token, copyLen);
+                tokenText[copyLen] = '\0';
+                strlcat(candidate, tokenText, sizeof(candidate));
+                if (g.textWidth(candidate) > metarWidth) {
+                    cursor = token;
+                    break;
+                }
+                strlcpy(wrapped, candidate, sizeof(wrapped));
+                used = strlen(wrapped);
+            }
+            if (wrapped[0] == '\0') {
+                break;
+            }
+            g.drawString(wrapped, leftX, lineY);
+            lineY += g.textLineAdvance();
+        }
+    } else {
+        g.setTextSize(1);
+        g.drawString("LOCAL TIME", leftX, top + 36);
+    }
+    g.setTextSize(1);
+}
+
+template <typename Gfx>
+static void drawSelectedAircraftDetail(
+    Gfx &g,
+    const Aircraft *item,
+    const RouteCacheEntry *routes,
+    size_t routeCount
+) {
+    int top = panelDetailTopY();
+    int height = PANEL_DETAIL_H;
+    g.fillRect(PANEL_X + 1, top, SCREEN_W - PANEL_X - 1, height, colorSelectedRow);
+    g.fillRect(PANEL_X + 2, top + 6, 3, height - 12, colorSelected);
+    g.drawWideLine(PANEL_X + PANEL_PAD, top + 2, PANEL_RIGHT, top + 2, 1.0f, colorGrid);
+
+    if (item == nullptr) {
+        return;
+    }
+
+    int textWidth = PANEL_RIGHT - PANEL_TEXT_X;
+    g.setTextDatum(textdatum_t::top_left);
+    g.setTextSize(2);
+    g.setTextColor(colorText, colorSelectedRow);
+    g.drawString(item->callsign[0] ? item->callsign : "????", PANEL_TEXT_X, top + 6);
+
+    const char *typeCode = item->type[0] ? item->type : "--";
+    const char *fullType = typeNameForCode(
+        renderTypeNameCache,
+        MAX_TYPE_CACHE,
+        item->type
+    );
+    g.setTextColor(colorSelected, colorSelectedRow);
+    g.drawString(typeCode, PANEL_TEXT_X, top + 26);
+    if (fullType != nullptr) {
+        int nameX = PANEL_TEXT_X + g.textWidth(typeCode) + g.textWidth("  ");
+        int nameWidth = PANEL_RIGHT - nameX;
+        if (nameWidth > 8) {
+            char typeLine[48];
+            strlcpy(typeLine, fullType, sizeof(typeLine));
+            truncateToWidth(g, typeLine, nameWidth);
+            g.setTextColor(colorText, colorSelectedRow);
+            g.drawString(typeLine, nameX, top + 26);
+        }
+    }
+
+    g.setTextSize(1);
+    g.setTextColor(colorDim, colorSelectedRow);
+    char line[96] = {};
+    appendTokenIfFits(g, line, sizeof(line), item->hex, textWidth);
+    appendTokenIfFits(g, line, sizeof(line), item->registration, textWidth);
+    appendTokenIfFits(g, line, sizeof(line), item->category, textWidth);
+    g.drawString(line[0] ? line : "NO ID", PANEL_TEXT_X, top + 48);
+
+    char distance[16];
+    char speed[16];
+    formatDistanceLabel(item->distanceKm, distance, sizeof(distance));
+    formatSpeedLabel(item->gsKnots, speed, sizeof(speed));
+    line[0] = '\0';
+    appendTokenIfFits(g, line, sizeof(line), distance, textWidth);
+    appendTokenIfFits(g, line, sizeof(line), item->alt[0] ? item->alt : "ALT --", textWidth);
+    appendTokenIfFits(g, line, sizeof(line), item->vsi, textWidth);
+    appendTokenIfFits(g, line, sizeof(line), speed, textWidth);
+    g.drawString(line, PANEL_TEXT_X, top + 62);
+
+    char heading[24];
+    snprintf(heading, sizeof(heading), "TRK %03.0f", item->hasTrack ? item->trackDeg : item->noseDeg);
+    line[0] = '\0';
+    appendTokenIfFits(g, line, sizeof(line), heading, textWidth);
+    if (item->squawk[0] != '\0') {
+        appendTokenIfFits(g, line, sizeof(line), item->squawk, textWidth);
+        const char *alert = squawkAlertLabel(item->squawk);
+        if (alert != nullptr) {
+            appendTokenIfFits(g, line, sizeof(line), alert, textWidth);
+        }
+    }
+    g.setTextColor(colorWarn, colorSelectedRow);
+    g.drawString(line, PANEL_TEXT_X, top + 76);
+
+    char route[(ROUTE_CITY_MAX_LEN * 2) + 16];
+    if (routeLabelForCallsign(
+            g, routes, routeCount, item->callsign, textWidth, route, sizeof(route))) {
+        g.setTextColor(colorRunway, colorSelectedRow);
+        g.drawString(route, PANEL_TEXT_X, top + 90);
+    }
+
+    g.setTextColor(colorDim, colorSelectedRow);
+    g.drawString("TAP HERE TO CLEAR", PANEL_TEXT_X, top + 124);
 }
 
 static void drawMapAttribution(PanelDisplay::Canvas &g) {
@@ -3310,12 +4129,17 @@ static void drawRadar() {
     char emptyStatus[64];
     char renderSelectedHex[7] = {};
     size_t renderRangeIndex = 0;
+    bool renderShowWeather = true;
+    bool renderTempF = false;
+    bool renderClock24 = true;
+    int renderLabelScale = LABEL_TEXT_SCALE_DEFAULT;
     lockState();
     renderCount = aircraftCount;
     if (renderCount > 0) {
         memcpy(renderAircraft, aircraft, renderCount * sizeof(Aircraft));
     }
     memcpy(renderRouteCache, routeCache, sizeof(renderRouteCache));
+    memcpy(renderTypeNameCache, typeNameCache, sizeof(renderTypeNameCache));
     strlcpy(
         renderSelectedHex,
         selectedAircraftHex,
@@ -3327,6 +4151,10 @@ static void drawRadar() {
     );
     strlcpy(emptyStatus, statusText.c_str(), sizeof(emptyStatus));
     renderRangeIndex = rangeIndex;
+    renderShowWeather = config.showWeather;
+    renderTempF = config.tempFahrenheit;
+    renderClock24 = config.clock24;
+    renderLabelScale = config.labelTextScalePercent;
     unlockState();
 
     bool logDraw = drawCounter <= 3 || drawCounter % 120 == 0;
@@ -3386,6 +4214,7 @@ static void drawRadar() {
 
     drawRunways(g);
 
+    radarHitCount = 0;
     size_t aircraftObstacleCount = 0;
     for (size_t i = 0; i < renderCount; i++) {
         int x = 0;
@@ -3400,33 +4229,28 @@ static void drawRadar() {
             ? aircraftSymbolRadius(renderAircraft[i])
             : 4.0f;
 
-        if (!renderAircraft[i].inside) {
-            g.fillSmoothCircle(x, y, 4, colorPlane);
-            continue;
+        if (radarHitCount < MAX_AIRCRAFT && renderAircraft[i].hex[0] != '\0') {
+            RadarHitTarget &hit = radarHitTargets[radarHitCount++];
+            strlcpy(hit.hex, renderAircraft[i].hex, sizeof(hit.hex));
+            hit.x = x;
+            hit.y = y;
+            hit.radius = std::max(
+                18,
+                static_cast<int>(lroundf(obstacle.radius + 8.0f))
+            );
         }
-        if (x < 0 || x >= PANEL_X || y < 0 || y >= SCREEN_H) continue;
-        drawAircraftSymbol(g, renderAircraft[i], x, y);
     }
 
     size_t labelCount = prepareRadarLabels(
         g,
         renderAircraft,
         renderCount,
-        renderSelectedHex
+        renderSelectedHex,
+        renderLabelScale,
+        renderRouteCache,
+        MAX_ROUTE_CACHE
     );
-    g.setTextSize(2);
-    int rangeTextWidth = g.textWidth(rangeLabel());
     RadarLabels::LabelRectObstacle staticLabelObstacles[] = {
-        {static_cast<float>(cx - 12), 4.0f, 24.0f, 28.0f},
-        {static_cast<float>(cx - 12), static_cast<float>(SCREEN_H - 32), 24.0f, 28.0f},
-        {static_cast<float>(cx - radius - 30), static_cast<float>(cy - 14), 24.0f, 28.0f},
-        {static_cast<float>(cx + radius + 6), static_cast<float>(cy - 14), 24.0f, 28.0f},
-        {
-            static_cast<float>(cx + radius - 22 - rangeTextWidth / 2 - 2),
-            static_cast<float>(cy - 25),
-            static_cast<float>(rangeTextWidth + 4),
-            22.0f
-        },
         {static_cast<float>(PANEL_X - 11), 0.0f, 11.0f, static_cast<float>(SCREEN_H)},
     };
     static uint32_t previousLabelLayoutMs = 0;
@@ -3437,7 +4261,8 @@ static void drawRadar() {
     previousLabelLayoutMs = labelLayoutNowMs;
     uint32_t labelLayoutRevision = static_cast<uint32_t>(renderRangeIndex) |
         (mapVisible ? 0x100U : 0U) |
-        (config.aircraftSymbolStyle == AircraftSymbolStyle::DetailedIcons ? 0x200U : 0U);
+        (config.aircraftSymbolStyle == AircraftSymbolStyle::DetailedIcons ? 0x200U : 0U) |
+        (static_cast<uint32_t>(renderLabelScale) << 16);
     RadarLabels::LabelLayoutMetrics labelMetrics;
     uint32_t labelLayoutStartedUs = micros();
     aircraftLabelLayout.solve(
@@ -3461,35 +4286,98 @@ static void drawRadar() {
     );
     uint32_t labelLayoutElapsedUs = micros() - labelLayoutStartedUs;
 
-    g.setTextSize(1);
     g.setTextDatum(textdatum_t::top_left);
-    auto drawLabelPass = [&](bool priorityPass) {
-        for (size_t labelIndex = 0; labelIndex < labelCount; labelIndex++) {
-            const RadarLabelRender &label = radarLabels[labelIndex];
-            const RadarLabels::LabelLayoutOutput &layout =
-                labelLayoutOutputs[labelIndex];
-            if (!layout.visible || label.mustShow != priorityPass) continue;
+    auto drawRadarLabel = [&](size_t labelIndex) {
+        const RadarLabelRender &label = radarLabels[labelIndex];
+        const RadarLabels::LabelLayoutOutput &layout =
+            labelLayoutOutputs[labelIndex];
+        if (!layout.visible) return;
 
-            int textX = lroundf(layout.x) + AIRCRAFT_LABEL_PADDING;
-            int textY = lroundf(layout.y) + AIRCRAFT_LABEL_PADDING;
-            for (size_t lineIndex = 0; lineIndex < label.lineCount; lineIndex++) {
-                const RadarLabelLine &line = label.lines[lineIndex];
-                int lineY = textY +
-                    static_cast<int>(lineIndex) * AIRCRAFT_LABEL_LINE_ADVANCE;
-                g.fillRect(
-                    textX - AIRCRAFT_LABEL_PADDING,
-                    lineY - AIRCRAFT_LABEL_PADDING,
-                    line.width + AIRCRAFT_LABEL_PADDING * 2,
-                    AIRCRAFT_LABEL_LINE_HEIGHT + AIRCRAFT_LABEL_PADDING * 2,
-                    colorBg
-                );
-                g.setTextColor(line.color, colorBg);
-                g.drawString(line.text, textX, lineY);
-            }
+        int textX = lroundf(layout.x) + AIRCRAFT_LABEL_PADDING;
+        int textY = lroundf(layout.y) + AIRCRAFT_LABEL_PADDING;
+        int lineY = textY;
+        for (size_t lineIndex = 0; lineIndex < label.lineCount; lineIndex++) {
+            const RadarLabelLine &line = label.lines[lineIndex];
+            g.setTextSize(line.textSize);
+            g.fillRect(
+                textX - AIRCRAFT_LABEL_PADDING,
+                lineY - AIRCRAFT_LABEL_PADDING,
+                line.width + AIRCRAFT_LABEL_PADDING * 2,
+                line.height + AIRCRAFT_LABEL_PADDING * 2,
+                colorBg
+            );
+            g.setTextColor(line.color, colorBg);
+            g.drawString(line.text, textX, lineY);
+            lineY += line.advance;
         }
     };
-    drawLabelPass(false);
-    drawLabelPass(true);
+
+    size_t labelByAircraft[MAX_AIRCRAFT];
+    for (size_t i = 0; i < renderCount; i++) {
+        labelByAircraft[i] = MAX_AIRCRAFT;
+    }
+    for (size_t labelIndex = 0; labelIndex < labelCount; labelIndex++) {
+        size_t aircraftIndex = radarLabels[labelIndex].aircraftIndex;
+        if (aircraftIndex < renderCount) {
+            labelByAircraft[aircraftIndex] = labelIndex;
+        }
+    }
+
+    size_t aircraftDrawOrder[MAX_AIRCRAFT];
+    for (size_t i = 0; i < renderCount; i++) {
+        aircraftDrawOrder[i] = i;
+    }
+    auto aircraftDrawsBefore = [&](size_t leftIndex, size_t rightIndex) {
+        const Aircraft &left = renderAircraft[leftIndex];
+        const Aircraft &right = renderAircraft[rightIndex];
+        bool leftSelected = renderSelectedHex[0] != '\0' &&
+            strcmp(left.hex, renderSelectedHex) == 0;
+        bool rightSelected = renderSelectedHex[0] != '\0' &&
+            strcmp(right.hex, renderSelectedHex) == 0;
+        if (leftSelected != rightSelected) {
+            return !leftSelected;
+        }
+        if (left.altitudeFt != right.altitudeFt) {
+            return left.altitudeFt < right.altitudeFt;
+        }
+        return leftIndex < rightIndex;
+    };
+    for (size_t i = 1; i < renderCount; i++) {
+        size_t value = aircraftDrawOrder[i];
+        size_t j = i;
+        while (j > 0 && aircraftDrawsBefore(value, aircraftDrawOrder[j - 1])) {
+            aircraftDrawOrder[j] = aircraftDrawOrder[j - 1];
+            j--;
+        }
+        aircraftDrawOrder[j] = value;
+    }
+
+    for (size_t orderIndex = 0; orderIndex < renderCount; orderIndex++) {
+        size_t i = aircraftDrawOrder[orderIndex];
+        int x = 0;
+        int y = 0;
+        if (!aircraftMapPoint(renderAircraft[i], mapVisible, x, y)) continue;
+
+        bool selected = renderSelectedHex[0] != '\0' &&
+            strcmp(renderAircraft[i].hex, renderSelectedHex) == 0;
+        uint16_t symbolColor = selected
+            ? colorSelected
+            : (config.aircraftSymbolStyle == AircraftSymbolStyle::DetailedIcons
+                ? colorWarn
+                : colorPlane);
+
+        if (!renderAircraft[i].inside) {
+            g.fillSmoothCircle(x, y, selected ? 6 : 4, symbolColor);
+        } else if (x >= 0 && x < PANEL_X && y >= 0 && y < SCREEN_H) {
+            drawAircraftTrajectory(g, renderAircraft[i], x, y, selected);
+            drawAircraftSymbol(g, renderAircraft[i], x, y, symbolColor);
+        }
+
+        size_t labelIndex = labelByAircraft[i];
+        if (labelIndex < labelCount) {
+            drawRadarLabel(labelIndex);
+        }
+    }
 
     if (mapVisible) {
         drawMapAttribution(g);
@@ -3514,6 +4402,15 @@ static void drawRadar() {
         emptyStatus,
         renderSelectedHex
     );
+    if (renderSelectedHex[0] != '\0') {
+        drawSelectedAircraftDetail(
+            g,
+            selectedAircraft,
+            renderRouteCache,
+            MAX_ROUTE_CACHE
+        );
+    }
+    drawWeatherClockFooter(g, renderShowWeather, renderTempF, renderClock24);
 
     g.endWrite();
     presentScreenOrRestart();
@@ -3528,16 +4425,120 @@ static void drawRadar() {
     }
 }
 
+static bool pointInRect(uint16_t x, uint16_t y, const TouchRect &rect) {
+    return static_cast<int>(x) >= rect.x &&
+        static_cast<int>(x) < rect.x + rect.w &&
+        static_cast<int>(y) >= rect.y &&
+        static_cast<int>(y) < rect.y + rect.h;
+}
+
+static void applyRangeDelta(int delta) {
+    bool changed = false;
+    lockState();
+    int next = static_cast<int>(rangeIndex) + delta;
+    if (next < 0) {
+        next = 0;
+    }
+    if (next >= static_cast<int>(RANGE_COUNT)) {
+        next = static_cast<int>(RANGE_COUNT) - 1;
+    }
+    if (static_cast<size_t>(next) != rangeIndex) {
+        rangeIndex = static_cast<size_t>(next);
+        forceAdsbFetch = true;
+        networkDataDirty = true;
+        changed = true;
+    }
+    unlockState();
+    if (changed) {
+        saveRange();
+    }
+}
+
+static bool handleRangeButtonTap(uint16_t x, uint16_t y) {
+    if (pointInRect(x, y, rangeMinusHit)) {
+        applyRangeDelta(-1);
+        return true;
+    }
+    if (pointInRect(x, y, rangePlusHit)) {
+        applyRangeDelta(1);
+        return true;
+    }
+    return false;
+}
+
+static bool selectOrToggleAircraftHex(const char *hex) {
+    if (hex == nullptr || hex[0] == '\0') {
+        return false;
+    }
+    bool selected = false;
+    lockState();
+    if (strcmp(selectedAircraftHex, hex) == 0) {
+        selectedAircraftHex[0] = '\0';
+    } else {
+        strlcpy(selectedAircraftHex, hex, sizeof(selectedAircraftHex));
+        selected = true;
+    }
+    networkDataDirty = true;
+    unlockState();
+    RADAR_LOGD("[track] %s hex=%s\n", selected ? "selected" : "cleared", hex);
+    return true;
+}
+
+static bool handleRadarAircraftTap(uint16_t x, uint16_t y) {
+    if (x >= PANEL_X) {
+        return false;
+    }
+    int bestIndex = -1;
+    int bestDist = 0;
+    for (size_t i = 0; i < radarHitCount; i++) {
+        int dx = static_cast<int>(x) - radarHitTargets[i].x;
+        int dy = static_cast<int>(y) - radarHitTargets[i].y;
+        int dist2 = dx * dx + dy * dy;
+        int limit = radarHitTargets[i].radius;
+        if (dist2 > limit * limit) {
+            continue;
+        }
+        if (bestIndex < 0 || dist2 < bestDist) {
+            bestIndex = static_cast<int>(i);
+            bestDist = dist2;
+        }
+    }
+    if (bestIndex < 0) {
+        return true;
+    }
+    selectOrToggleAircraftHex(radarHitTargets[bestIndex].hex);
+    return true;
+}
+
 static bool handleAircraftListTap(uint16_t x, uint16_t y) {
     if (x < PANEL_X) {
         return false;
     }
+    if (y >= panelFooterTopY()) {
+        return true;
+    }
+
+    bool hadSelection = false;
+    lockState();
+    hadSelection = selectedAircraftHex[0] != '\0';
+    unlockState();
+
+    if (hadSelection && y >= panelDetailTopY() && y < panelFooterTopY()) {
+        lockState();
+        selectedAircraftHex[0] = '\0';
+        networkDataDirty = true;
+        unlockState();
+        RADAR_LOGD("[track] cleared from detail card\n");
+        return true;
+    }
+
     if (y < PANEL_LIST_TOP) {
         return true;
     }
 
     size_t row = static_cast<size_t>((y - PANEL_LIST_TOP) / PANEL_ROW_H);
-    if (row >= visibleListRowCount || row >= panelVisibleRows) {
+    size_t maxRows = listRowCapacity(hadSelection);
+    if (row >= visibleListRowCount || row >= maxRows) {
         return true;
     }
 
@@ -3553,7 +4554,7 @@ static bool handleAircraftListTap(uint16_t x, uint16_t y) {
     if (strcmp(selectedAircraftHex, tappedHex) == 0) {
         selectedAircraftHex[0] = '\0';
         changed = true;
-    } else if (findAircraftTrackLocked(tappedHex) != nullptr) {
+    } else {
         strlcpy(
             selectedAircraftHex,
             tappedHex,
@@ -3579,6 +4580,9 @@ static bool handleAircraftListTap(uint16_t x, uint16_t y) {
 }
 
 static void handleTouch() {
+    if (OtaUpdate::inProgress()) {
+        return;
+    }
     uint16_t x = 0;
     uint16_t y = 0;
     uint32_t now = millis();
@@ -3616,13 +4620,11 @@ static void handleTouch() {
             held < TOUCH_LONG_PRESS_MS &&
             movedX <= TOUCH_TAP_MOVE_MAX_PX &&
             movedY <= TOUCH_TAP_MOVE_MAX_PX;
-        if (tap && !handleAircraftListTap(touchDownX, touchDownY)) {
-            lockState();
-            rangeIndex = (rangeIndex + 1) % RANGE_COUNT;
-            forceAdsbFetch = true;
-            networkDataDirty = true;
-            unlockState();
-            saveRange();
+        if (tap) {
+            if (!handleRangeButtonTap(touchDownX, touchDownY) &&
+                !handleAircraftListTap(touchDownX, touchDownY)) {
+                handleRadarAircraftTap(touchDownX, touchDownY);
+            }
         }
     }
     if (!down) {
@@ -3641,7 +4643,9 @@ static bool shouldDrawRadarFrame(uint32_t now) {
     uint32_t previousDrawMs = lastDrawMs;
     unlockState();
 
-    return dirty || (hasAircraft && now - previousDrawMs >= RADAR_DRAW_INTERVAL_MS);
+    return dirty ||
+        (hasAircraft && now - previousDrawMs >= RADAR_DRAW_INTERVAL_MS) ||
+        (now - previousDrawMs >= 1000);
 }
 
 static void networkTaskMain(void *) {
@@ -3650,6 +4654,10 @@ static void networkTaskMain(void *) {
 
     while (true) {
         AppWatchdog::feed();
+        if (OtaUpdate::inProgress()) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
         uint32_t now = millis();
         serviceWifiReconnect(now);
         if (WiFi.status() == WL_CONNECTED) {
@@ -3666,6 +4674,61 @@ static void networkTaskMain(void *) {
             }
 
             serviceRouteLookup();
+            serviceTypeLookup();
+
+            static char cachedNearestIcao[8] = {};
+            static double cachedNearestLat = 999.0;
+            static double cachedNearestLon = 999.0;
+            char metarIcao[8] = {};
+            char manualIcao[8] = {};
+            char selectedIcao[8] = {};
+            double weatherLat = 0;
+            double weatherLon = 0;
+            bool fetchMetar = false;
+            AirportSelectionMode airportMode = AirportSelectionMode::Automatic;
+            lockState();
+            weatherLat = config.lat;
+            weatherLon = config.lon;
+            fetchMetar = config.showWeather;
+            airportMode = config.airportSelectionMode;
+            strlcpy(manualIcao, config.manualAirportIcao.c_str(), sizeof(manualIcao));
+            if (selectedAirportCount > 0 && selectedAirports[0].airport != nullptr) {
+                strlcpy(
+                    selectedIcao,
+                    selectedAirports[0].airport->icao,
+                    sizeof(selectedIcao)
+                );
+            }
+            unlockState();
+            if (fetchMetar) {
+                if (airportMode == AirportSelectionMode::Manual && manualIcao[0] != '\0') {
+                    strlcpy(metarIcao, manualIcao, sizeof(metarIcao));
+                } else if (selectedIcao[0] != '\0') {
+                    strlcpy(metarIcao, selectedIcao, sizeof(metarIcao));
+                } else {
+                    const bool locationChanged =
+                        fabs(weatherLat - cachedNearestLat) > 0.0001 ||
+                        fabs(weatherLon - cachedNearestLon) > 0.0001;
+                    if (cachedNearestIcao[0] == '\0' || locationChanged) {
+                        const AirportCatalogEntry *airport =
+                            nearestAirport(weatherLat, weatherLon);
+                        cachedNearestIcao[0] = '\0';
+                        if (airport != nullptr) {
+                            strlcpy(cachedNearestIcao, airport->icao,
+                                    sizeof(cachedNearestIcao));
+                        }
+                        cachedNearestLat = weatherLat;
+                        cachedNearestLon = weatherLon;
+                    }
+                    strlcpy(metarIcao, cachedNearestIcao, sizeof(metarIcao));
+                }
+            }
+            if (WeatherTime::refreshIfDue(
+                    weatherLat, weatherLon, fetchMetar ? metarIcao : "")) {
+                lockState();
+                networkDataDirty = true;
+                unlockState();
+            }
         }
 
         AppWatchdog::feed();
@@ -3706,6 +4769,8 @@ static void initPalette() {
     colorTrackBright = screen.color565(210, 176, 42);
     colorTrackForecast = screen.color565(125, 108, 42);
     colorSelectedRow = screen.color565(5, 28, 19);
+    colorSelected = screen.color565(46, 214, 92);
+    colorTrajectory = screen.color565(255, 0, 255);
 }
 
 #if PLANE_RADAR_LOG_LEVEL >= PLANE_RADAR_LOG_LEVEL_DEBUG
@@ -3909,7 +4974,7 @@ void setup() {
         setBootStageDetails(
             BOOT_SERVICES,
             "HTTP SERVER / PORT 80",
-            "SETUP AP / PLANERADAR-SETUP",
+            "SETUP AP / BIGPLANERADAR-SETUP",
             "AP ADDRESS / 192.168.4.1"
         );
         logStep("startPortal begin");
@@ -3929,7 +4994,7 @@ void setup() {
             setBootStageDetails(
                 BOOT_SERVICES,
                 "HTTP SERVER / PORT 80",
-                "FALLBACK AP / PLANERADAR-SETUP",
+                "FALLBACK AP / BIGPLANERADAR-SETUP",
                 "AP ADDRESS / 192.168.4.1"
             );
             logStep("connect failed, startPortal begin");
@@ -3947,7 +5012,7 @@ void setup() {
             setBootStageDetails(
                 BOOT_SERVICES,
                 serviceIpLine,
-                "MDNS / PLANE-RADAR.LOCAL",
+                "MDNS / BIGPLANE-RADAR.LOCAL",
                 "BACKGROUND NETWORK TASK / CORE 0"
             );
             setBootStage(BOOT_SERVICES, BootStatus::Ok);
@@ -4003,7 +5068,7 @@ void setup() {
     startNetworkTask();
     if (setupMode || portalActive) {
         logStep("setup portal active");
-        drawStatusScreen("PLANE RADAR SETUP", "Connect to Wi-Fi AP: PlaneRadar-Setup\nOpen http://192.168.4.1\nSet Wi-Fi and radar location.");
+        drawStatusScreen("BIG PLANE RADAR SETUP", "Connect to Wi-Fi AP: BigPlaneRadar-Setup\nOpen http://192.168.4.1\nSet Wi-Fi and radar location.");
         return;
     }
 
@@ -4016,6 +5081,10 @@ void setup() {
 void loop() {
     AppWatchdog::feed();
     server.handleClient();
+    if (OtaUpdate::inProgress()) {
+        delay(1);
+        return;
+    }
     handleTouch();
 
     uint32_t now = millis();
