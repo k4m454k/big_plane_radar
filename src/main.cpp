@@ -2507,6 +2507,9 @@ static bool fetchAdsb() {
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
+    // ArduinoJson reads HTTPClient's raw stream directly. HTTP/1.0 avoids
+    // transfer-chunk framing being mistaken for a valid JSON number.
+    http.useHTTP10(true);
     if (!http.begin(client, url)) {
         strlcpy(responseLine, "HTTP BEGIN FAILED", sizeof(responseLine));
         setBootStageDetails(BOOT_DATA, endpointLine, centerLine, radiusLine, responseLine);
