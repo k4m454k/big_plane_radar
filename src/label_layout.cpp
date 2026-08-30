@@ -14,6 +14,7 @@ static constexpr float kNormalMaxGapPx = 64.0f;
 static constexpr float kPriorityMaxGapPx = 96.0f;
 static constexpr float kMaxMovementPxPerSecond = 64.0f;
 static constexpr float kMovementDeadZonePx = 0.25f;
+static constexpr bool kResolveOverlappingLabels = false;
 static constexpr float kCourseAvoidDistancePx = 80.0f;
 static constexpr float kCourseConeCosineSquared = 0.58682409f;
 static constexpr float kInverseSqrtTwo = 0.70710678f;
@@ -41,6 +42,16 @@ static float clampFloat(float value, float low, float high) {
     if (value < low) return low;
     if (value > high) return high;
     return value;
+}
+
+static bool isOwnAircraftObstacle(
+    const AircraftObstacle &obstacle,
+    float anchorX,
+    float anchorY
+) {
+    float dx = obstacle.x - anchorX;
+    float dy = obstacle.y - anchorY;
+    return dx * dx + dy * dy <= 16.0f;
 }
 
 static float minFloat(float a, float b) {
@@ -446,6 +457,9 @@ void LabelLayout::solve(
                      obstacleIndex < aircraftObstacleCount;
                      obstacleIndex++) {
                     const AircraftObstacle &obstacle = aircraftObstacles[obstacleIndex];
+                    if (!isOwnAircraftObstacle(obstacle, input.anchorX, input.anchorY)) {
+                        continue;
+                    }
                     float nearestX = clampFloat(
                         obstacle.x,
                         candidateX,
@@ -531,6 +545,9 @@ void LabelLayout::solve(
              obstacleIndex < aircraftObstacleCount;
              obstacleIndex++) {
             const AircraftObstacle &obstacle = aircraftObstacles[obstacleIndex];
+            if (!isOwnAircraftObstacle(obstacle, input.anchorX, input.anchorY)) {
+                continue;
+            }
             float required = obstacle.radius + kMinimumSymbolGapPx;
             if (pointToRectDistanceSquared(
                     obstacle.x,
@@ -621,6 +638,9 @@ void LabelLayout::solve(
              obstacleIndex < aircraftObstacleCount;
              obstacleIndex++) {
             const AircraftObstacle &obstacle = aircraftObstacles[obstacleIndex];
+            if (!isOwnAircraftObstacle(obstacle, input.anchorX, input.anchorY)) {
+                continue;
+            }
             float required = obstacle.radius + kMinimumSymbolGapPx;
             bool insideX = obstacle.x >= work.x &&
                 obstacle.x <= work.x + input.width;
@@ -986,6 +1006,9 @@ void LabelLayout::solve(
              obstacleIndex < aircraftObstacleCount;
              obstacleIndex++) {
             const AircraftObstacle &obstacle = aircraftObstacles[obstacleIndex];
+            if (!isOwnAircraftObstacle(obstacle, input.anchorX, input.anchorY)) {
+                continue;
+            }
             float required = obstacle.radius + kMinimumSymbolGapPx;
             float requiredSquared = required * required;
             float distanceSquared = pointToRectDistanceSquared(
@@ -1190,6 +1213,9 @@ void LabelLayout::solve(
     }
 
     auto canJoinCluster = [&](size_t workIndex) {
+        if (!kResolveOverlappingLabels) {
+            return false;
+        }
         const WorkItem &work = work_[workIndex];
         return (work.state->visible || work.input->mustShow) &&
             work.state->orbitAngleValid &&
@@ -1510,7 +1536,8 @@ void LabelLayout::solve(
             : collisionIndex + workCount - collisionSearchStart;
         bool searchScheduled = workCount <= kCollisionSearchesPerFrame ||
             searchOffset < kCollisionSearchesPerFrame || input.mustShow;
-        if (conflictDepth > 0.0f &&
+        if (kResolveOverlappingLabels &&
+            conflictDepth > 0.0f &&
             searchScheduled &&
             !clusterPending[workIndex]) {
             float centerX = work.x + input.width * 0.5f;
@@ -1712,7 +1739,8 @@ void LabelLayout::solve(
                 other.input->height
             );
             if (overlap > maxOverlap) maxOverlap = overlap;
-            if (overlap > 0.5f &&
+            if (kResolveOverlappingLabels &&
+                overlap > 0.5f &&
                 !work.orbiting &&
                 !other.orbiting &&
                 !work.coolingDown &&

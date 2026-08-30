@@ -697,7 +697,34 @@ void Canvas::blendAlphaMask4(
 }
 
 void Canvas::setTextSize(uint8_t size) {
-    _textSize = std::max<uint8_t>(1, size);
+    setTextScalePercent(static_cast<int>(std::max<uint8_t>(1, size)) * 100);
+}
+
+void Canvas::setTextScalePercent(int percent) {
+    if (percent < 100) percent = 100;
+    if (percent > 400) percent = 400;
+    _textScalePercent = ((percent + 50) / 100) * 100;
+    if (_textScalePercent < 100) _textScalePercent = 100;
+}
+
+int Canvas::textScalePercent() const {
+    return _textScalePercent;
+}
+
+int Canvas::glyphWidth() const {
+    return std::max(1, FONT_W * _textScalePercent / 100);
+}
+
+int Canvas::glyphAdvance() const {
+    return std::max(1, FONT_ADVANCE * _textScalePercent / 100);
+}
+
+int Canvas::textHeight() const {
+    return std::max(1, FONT_H * _textScalePercent / 100);
+}
+
+int Canvas::textLineAdvance() const {
+    return std::max(1, LINE_ADVANCE * _textScalePercent / 100);
 }
 
 void Canvas::setTextColor(uint16_t fg) {
@@ -715,7 +742,8 @@ void Canvas::setTextDatum(textdatum_t datum) {
 
 int Canvas::textWidth(const char *text) const {
     if (text == nullptr || text[0] == '\0') return 0;
-    return static_cast<int>(strlen(text)) * FONT_ADVANCE * _textSize - _textSize;
+    const size_t n = strlen(text);
+    return static_cast<int>(n - 1) * glyphAdvance() + glyphWidth();
 }
 
 int Canvas::textWidth(const String &text) const {
@@ -734,12 +762,26 @@ int Canvas::mediumTextWidth(const String &text) const {
 
 void Canvas::drawChar(char ch, int x, int y) {
     const uint8_t *rows = glyphFor(ch);
-    int s = _textSize;
-    fillRect(x, y, FONT_W * s, FONT_H * s, _textBg);
-    for (int yy = 0; yy < FONT_H; yy++) {
-        for (int xx = 0; xx < FONT_W; xx++) {
-            if (rows[yy] & (1 << (FONT_W - 1 - xx))) {
-                fillRect(x + xx * s, y + yy * s, s, s, _textFg);
+    const int dw = glyphWidth();
+    const int dh = textHeight();
+    fillRect(x, y, dw, dh, _textBg);
+    if (_textScalePercent % 100 == 0) {
+        const int s = std::max(1, _textScalePercent / 100);
+        for (int yy = 0; yy < FONT_H; yy++) {
+            for (int xx = 0; xx < FONT_W; xx++) {
+                if (rows[yy] & (1 << (FONT_W - 1 - xx))) {
+                    fillRect(x + xx * s, y + yy * s, s, s, _textFg);
+                }
+            }
+        }
+        return;
+    }
+    for (int yy = 0; yy < dh; yy++) {
+        const int sy = yy * FONT_H / dh;
+        for (int xx = 0; xx < dw; xx++) {
+            const int sx = xx * FONT_W / dw;
+            if (rows[sy] & (1 << (FONT_W - 1 - sx))) {
+                drawPixel(x + xx, y + yy, _textFg);
             }
         }
     }
@@ -748,7 +790,7 @@ void Canvas::drawChar(char ch, int x, int y) {
 void Canvas::drawString(const char *text, int x, int y) {
     if (text == nullptr) return;
     int w = textWidth(text);
-    int h = FONT_H * _textSize;
+    int h = textHeight();
     int startX = x;
     int startY = y;
     if (_datum == textdatum_t::top_right) {
@@ -757,8 +799,9 @@ void Canvas::drawString(const char *text, int x, int y) {
         startX = x - w / 2;
         startY = y - h / 2;
     }
+    const int advance = glyphAdvance();
     for (size_t i = 0; text[i] != '\0'; i++) {
-        drawChar(text[i], startX + static_cast<int>(i) * FONT_ADVANCE * _textSize, startY);
+        drawChar(text[i], startX + static_cast<int>(i) * advance, startY);
     }
 }
 
@@ -773,7 +816,7 @@ void Canvas::drawString(const String &text, int x, int y) {
             drawString(line, x, lineY);
             if (next < 0) break;
             start = next + 1;
-            lineY += LINE_ADVANCE * _textSize;
+            lineY += textLineAdvance();
         }
         return;
     }

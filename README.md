@@ -73,8 +73,8 @@ setup Wi-Fi:
 
 ### 4. Configure the radar
 
-1. Wait for the display to create the Wi-Fi network `PlaneRadar-Setup`.
-2. Connect the computer or phone to `PlaneRadar-Setup`. It has no password.
+1. Wait for the display to create the Wi-Fi network `BigPlaneRadar-Setup`.
+2. Connect the computer or phone to `BigPlaneRadar-Setup`. It has no password.
 3. If the setup page does not open automatically, open
    **[http://192.168.4.1](http://192.168.4.1)**.
 4. Enter the name and password of your 2.4 GHz Wi-Fi network.
@@ -85,12 +85,12 @@ setup Wi-Fi:
 7. Leave the other settings at their defaults for the first run.
 8. Press **Save and reboot**.
 
-`PlaneRadar-Setup` disappearing after **Save and reboot** is normal: the display
+`BigPlaneRadar-Setup` disappearing after **Save and reboot** is normal: the display
 is switching to your home Wi-Fi.
 
-If **Use browser location** cannot load while connected to `PlaneRadar-Setup`,
+If **Use browser location** cannot load while connected to `BigPlaneRadar-Setup`,
 enter coordinates manually. You can change them later from
-`http://plane-radar.local` after both devices are connected to your normal
+`http://bigplane-radar.local` after both devices are connected to your normal
 Wi-Fi.
 
 The first map-enabled boot downloads the XYZ tiles needed for four map views.
@@ -100,11 +100,12 @@ zoom, dimensions, PNG size, download progress, and decode time.
 
 ### Everyday controls
 
-- tap the radar to change its range;
-- tap an aircraft in the right-hand list to show or hide its track;
+- use `+` / `-` beside RANGE to change distance;
+- tap an aircraft on the map or in the list to show its track, predicted path, and a detail card;
+- tap the detail card (or the same list row again) to clear the selection;
 - long-press the screen to reopen the setup portal;
-- open [http://plane-radar.local](http://plane-radar.local) from the same Wi-Fi
-  to change settings later.
+- open [http://bigplane-radar.local](http://bigplane-radar.local) from the same Wi-Fi
+  to change settings later, including METAR/clock options, aircraft tag size, and firmware updates.
 
 ### If something does not work
 
@@ -118,10 +119,10 @@ zoom, dimensions, PNG size, download progress, and decode time.
 - **Linux sees the port but the installer cannot open it:** add your user to
   the `dialout` group with `sudo usermod -aG dialout "$USER"`, sign out, and
   sign in again.
-- **`PlaneRadar-Setup` does not appear:** press `RESET`, wait for the boot
+- **`BigPlaneRadar-Setup` does not appear:** press `RESET`, wait for the boot
   sequence, and hold a finger on the screen when the footer asks you to hold it
   for setup.
-- **`plane-radar.local` does not open:** use the display's IP address from your
+- **`bigplane-radar.local` does not open:** use the display's IP address from your
   router instead. For example, open `http://192.168.1.123`.
 - **The boot screen says `NO KEY`:** a Stadia map was selected without a valid
   API key. Reopen setup and add the key or select `None`.
@@ -161,7 +162,7 @@ appears as `/dev/ttyACM*` or `/dev/ttyUSB*`; the user may need access to the
 
 - one universal firmware image with automatic ESP32-S3-Touch-LCD-7/7B
   detection and resolution-aware layout;
-- first-boot setup portal: `PlaneRadar-Setup`;
+- first-boot setup portal: `BigPlaneRadar-Setup`;
 - saved Wi-Fi, radar center, units, airport overlay, aircraft symbol style,
   aircraft label, map brightness, and range settings in NVS;
 - automatic selection of the nearest one to three medium/large airports and all
@@ -169,8 +170,14 @@ appears as `/dev/ttyACM*` or `/dev/ttyUSB*`; the user may need access to the
 - ADS-B data from `https://opendata.adsb.fi/api/v3/`;
 - local dead-reckoning between 5-second ADS-B updates, redrawn continuously;
 - up to 10 minutes of confirmed positions are retained per aircraft in PSRAM;
-  tap an aircraft row to toggle its track, while the extrapolated final segment
-  remains temporary and is never committed to history;
+  tap an aircraft row to show its history track and a detail card on the right;
+  tap the card (or the same row) to clear;
+- magenta speed vectors in front of aircraft show the next ~60 seconds of
+  ground track, independent of the selected history trail;
+- local clock and METAR for the configured airport in the right-hand footer;
+- selected aircraft are highlighted in green on the map, including off-screen dots;
+- authenticated OTA firmware updates at `http://bigplane-radar.local/firmware`
+  (user `admin`);
 - optional route city line populated dynamically from cached callsign lookups at
   `https://api.adsbdb.com/`; no global city table is embedded in the firmware;
 - optional Stadia Maps `Alidade Smooth Dark` raster-tile background using the
@@ -185,16 +192,19 @@ appears as `/dev/ttyACM*` or `/dev/ttyUSB*`; the user may need access to the
   original circular radar boundary remains unchanged;
 - each aircraft label line has a tightly fitted black backing for readability
   without obscuring unnecessary map area;
+- aircraft tags show the route pair on top when known, then callsign and type;
 - independently configurable callsign, aircraft type, altitude, and vertical
   rate label fields; enabled lines automatically close any gaps;
+- aircraft tag size on the radar map is adjustable from 100% to 200% in setup;
+- the aircraft list and detail card show city names with ICAO codes when known;
 - selectable anti-aliased detailed aircraft icons or the original classic
   triangle and rotorcraft symbols, with visual previews in the setup page;
 - detailed icons are used consistently on the map and in the aircraft list;
   their 5-degree rotation frames are precomputed in flash and alpha-blended
   directly into the RGB565 framebuffer;
 - background Wi-Fi reconnect after router/power outages;
-- touch controls: tap the radar to cycle range, tap an aircraft row to toggle
-  its track, and long press to start the setup portal;
+- touch controls: `+`/`-` change range, tap an aircraft on the map or list to
+  toggle its track, and long press to start the setup portal;
 - boot setup window: hold the screen during startup to force the setup portal;
 - screenshot endpoint: `/screenshot` and `/screenshot.bmp`;
 - conservative RGB LCD settings for this panel: `13 MHz` PCLK and `800 * 10`
@@ -347,7 +357,7 @@ device setup page and are stored in NVS. If the key is empty or a map request
 fails, the radar continues on its normal plain background.
 
 When Stadia is enabled, boot downloads and assembles the 256x256 XYZ tiles
-needed for each of the four range presets. The rendered views remain in PSRAM
+needed for each of the five range presets. The rendered views remain in PSRAM
 until restart. They are refreshed only on the next boot, including after
 changing the radar coordinates in setup. The boot log reports both view and
 XYZ-tile progress; it shows `SKIP` when maps are disabled and `NO KEY` when
@@ -405,7 +415,7 @@ Use the merged binary for browser flashing.
 ## Setup Page Reference
 
 The setup page is available at `http://192.168.4.1` while connected to
-`PlaneRadar-Setup`, or at `http://plane-radar.local` after the board joins your
+`BigPlaneRadar-Setup`, or at `http://bigplane-radar.local` after the board joins your
 normal Wi-Fi. It controls the radar center, units, airport/runway selection,
 aircraft symbol style, label fields, map brightness, and map background.
 
@@ -426,14 +436,14 @@ Stadia Maps, OpenMapTiles, and OpenStreetMap attribution over the map. See the o
 When the board is connected to Wi-Fi, capture the current screen:
 
 ```sh
-curl -o docs/screenshot.bmp http://plane-radar.local/screenshot.bmp
+curl -o docs/screenshot.bmp http://bigplane-radar.local/screenshot.bmp
 ```
 
 Direct URLs:
 
 ```text
-http://plane-radar.local/screenshot
-http://plane-radar.local/screenshot.bmp
+http://bigplane-radar.local/screenshot
+http://bigplane-radar.local/screenshot.bmp
 ```
 
 If mDNS is unavailable, use the IP shown in the setup page:
@@ -441,6 +451,21 @@ If mDNS is unavailable, use the IP shown in the setup page:
 ```sh
 curl -o docs/screenshot.bmp http://<device-ip>/screenshot.bmp
 ```
+
+## Firmware updates (OTA)
+
+After this dual-OTA partition table is installed once over USB or the web
+installer, later updates can use the setup page:
+
+1. Open [http://bigplane-radar.local](http://bigplane-radar.local) (or the device IP).
+2. Open **Firmware update**.
+3. Sign in with username `admin` and the OTA password (`plane-radar` unless you
+   changed it).
+4. Upload the application image (`big_plane_radar.ino.bin` from a source
+   build). Do not upload `.merged.bin`.
+
+The first flash of this firmware must be a full image at offset `0x0` because
+the partition table changed from a single 3 MB app to two 3 MB OTA slots.
 
 ## Release Binaries
 
